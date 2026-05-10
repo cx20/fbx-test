@@ -155,7 +155,7 @@ function parseProps70(node) {
 // ============================================================
 // Build Babylon.js VertexData from FBX Geometry node
 // ============================================================
-function buildVertexData(geoNode) {
+function buildVertexData(geoNode, geometryTransform = null) {
     const verts    = prop0(findNode(geoNode.children, 'Vertices'));
     const polyIdx  = prop0(findNode(geoNode.children, 'PolygonVertexIndex'));
     if (!verts || !polyIdx) throw new Error('Geometry missing Vertices or PolygonVertexIndex');
@@ -214,8 +214,14 @@ function buildVertexData(geoNode) {
                 const posI = poly[vi];
                 const pvI  = pvGlobal + vi;
 
-                // Position (negate Z: RH→LH)
-                positions.push(verts[posI * 3], verts[posI * 3 + 1], -verts[posI * 3 + 2]);
+                // Position (negate Z: RH→LH), then apply FBX geometric transform.
+                const px = verts[posI * 3];
+                const py = verts[posI * 3 + 1];
+                const pz = -verts[posI * 3 + 2];
+                const p = geometryTransform
+                    ? applyGeometryTransformToPoint(px, py, pz, geometryTransform)
+                    : [px, py, pz];
+                positions.push(p[0], p[1], p[2]);
 
                 // Normal (negate Z)
                 if (normVals) {
@@ -225,7 +231,13 @@ function buildVertexData(geoNode) {
                     } else {
                         ni = normRef === 'IndexToDirect' ? normIdx[polyGlobal] : polyGlobal;
                     }
-                    normals.push(normVals[ni * 3], normVals[ni * 3 + 1], -normVals[ni * 3 + 2]);
+                    const nx = normVals[ni * 3];
+                    const ny = normVals[ni * 3 + 1];
+                    const nz = -normVals[ni * 3 + 2];
+                    const n = geometryTransform
+                        ? applyGeometryTransformToNormal(nx, ny, nz, geometryTransform)
+                        : [nx, ny, nz];
+                    normals.push(n[0], n[1], n[2]);
                 }
 
                 // UV: pass through raw FBX UVs; Babylon.js Texture default invertY=true handles V flip
@@ -266,23 +278,87 @@ function buildVertexData(geoNode) {
 // ============================================================
 function getModelTransform(modelNode) {
     const p70 = parseProps70(findNode(modelNode.children, 'Properties70'));
-    const T    = p70.get('Lcl Translation') ?? [0, 0, 0];
-    const R    = p70.get('Lcl Rotation')    ?? [0, 0, 0];
-    const S    = p70.get('Lcl Scaling')     ?? [1, 1, 1];
-    const preR = p70.get('PreRotation')     ?? [0, 0, 0];
-    return { T, R, S, preR };
+    const T        = p70.get('Lcl Translation') ?? [0, 0, 0];
+    const R        = p70.get('Lcl Rotation')    ?? [0, 0, 0];
+    const S        = p70.get('Lcl Scaling')     ?? [1, 1, 1];
+    const preR     = p70.get('PreRotation')     ?? [0, 0, 0];
+    const rotOrder = p70.get('RotationOrder')   ?? 0;
+    const geoT     = p70.get('GeometricTranslation') ?? [0, 0, 0];
+    const geoR     = p70.get('GeometricRotation')    ?? [0, 0, 0];
+    const geoS     = p70.get('GeometricScaling')     ?? [1, 1, 1];
+    return { T, R, S, preR, rotOrder, geoT, geoR, geoS };
 }
 
-// Convert FBX Euler XYZ (degrees) → Babylon.js quaternion under Z-negate conversion.
-// Derivation: R_bjs = M_Z·R_fbx·M_Z  (where M_Z negates the Z axis)
-//   gives  Rx(-rx)·Ry(-ry)·Rz(+rz)  in explicit XYZ order.
-function fbxEulerToQuat(deg) {
+// Convert FBX Euler (degrees) → Babylon.js quaternion under RH→LH (Z-negate) conversion.
+// M_Z conjugation rules: Rx(a)→Rx(-a), Ry(a)→Ry(-a), Rz(a)→Rz(a).
+// FBX RotationOrder specifies the application order (first letter applied first to vector).
+// For order ABC: R_fbx = Rc·Rb·Ra in matrix form; BJS q1.multiply(q2) applies q2 first.
+// PreRotation is always XYZ (order=0) per FBX spec; LclRotation uses the node's rotOrder.
+function fbxEulerToQuat(deg, rotOrder = 0) {
     const rx = BABYLON.Tools.ToRadians(deg[0]);
     const ry = BABYLON.Tools.ToRadians(deg[1]);
     const rz = BABYLON.Tools.ToRadians(deg[2]);
-    return BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, -rx)
-        .multiply(BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Y, -ry))
-        .multiply(BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z,  rz));
+    const Rx = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, -rx);
+    const Ry = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Y, -ry);
+    const Rz = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z,  rz);
+    switch (rotOrder) {
+        case 1: return Ry.multiply(Rz).multiply(Rx); // XZY
+        case 2: return Rx.multiply(Rz).multiply(Ry); // YZX
+        case 3: return Rz.multiply(Rx).multiply(Ry); // YXZ
+        case 4: return Ry.multiply(Rx).multiply(Rz); // ZXY
+        case 5: return Rx.multiply(Ry).multiply(Rz); // ZYX
+        default: return Rz.multiply(Ry).multiply(Rx); // XYZ (0) — default
+    }
+}
+
+function hasNonIdentityGeometryTransform({ geoT, geoR, geoS }) {
+    const eps = 1e-8;
+    return Math.abs(geoT[0]) > eps || Math.abs(geoT[1]) > eps || Math.abs(geoT[2]) > eps ||
+           Math.abs(geoR[0]) > eps || Math.abs(geoR[1]) > eps || Math.abs(geoR[2]) > eps ||
+           Math.abs(geoS[0] - 1) > eps || Math.abs(geoS[1] - 1) > eps || Math.abs(geoS[2] - 1) > eps;
+}
+
+function makeGeometryTransform(modelTransform) {
+    if (!hasNonIdentityGeometryTransform(modelTransform)) return null;
+    const { geoT, geoR, geoS, rotOrder } = modelTransform;
+    return {
+        translation: new BABYLON.Vector3(geoT[0], geoT[1], -geoT[2]),
+        rotation: fbxEulerToQuat(geoR, rotOrder),
+        scaling: new BABYLON.Vector3(geoS[0], geoS[1], geoS[2]),
+    };
+}
+
+function rotateVectorByQuaternion(x, y, z, q) {
+    const tx = 2 * (q.y * z - q.z * y);
+    const ty = 2 * (q.z * x - q.x * z);
+    const tz = 2 * (q.x * y - q.y * x);
+    return [
+        x + q.w * tx + (q.y * tz - q.z * ty),
+        y + q.w * ty + (q.z * tx - q.x * tz),
+        z + q.w * tz + (q.x * ty - q.y * tx),
+    ];
+}
+
+function applyGeometryTransformToPoint(x, y, z, transform) {
+    const sx = x * transform.scaling.x;
+    const sy = y * transform.scaling.y;
+    const sz = z * transform.scaling.z;
+    const r = rotateVectorByQuaternion(sx, sy, sz, transform.rotation);
+    return [
+        r[0] + transform.translation.x,
+        r[1] + transform.translation.y,
+        r[2] + transform.translation.z,
+    ];
+}
+
+function applyGeometryTransformToNormal(x, y, z, transform) {
+    // Inverse-scale before rotation is the normal-matrix equivalent for TRS.
+    const sx = transform.scaling.x !== 0 ? x / transform.scaling.x : x;
+    const sy = transform.scaling.y !== 0 ? y / transform.scaling.y : y;
+    const sz = transform.scaling.z !== 0 ? z / transform.scaling.z : z;
+    const r = rotateVectorByQuaternion(sx, sy, sz, transform.rotation);
+    const len = Math.hypot(r[0], r[1], r[2]) || 1;
+    return [r[0] / len, r[1] / len, r[2] / len];
 }
 
 // ============================================================
@@ -311,14 +387,18 @@ async function loadFBX(url, scene) {
     const baseDir = url.substring(0, url.lastIndexOf('/') + 1);
 
     // Index objects by id
-    const geoById   = new Map();
-    const modelById = new Map();
-    const matById   = new Map();
+    const geoById      = new Map();
+    const modelById    = new Map(); // Mesh-type Model nodes
+    const allModelById = new Map(); // ALL Model nodes (Mesh, LimbNode, Null, ...)
+    const matById      = new Map();
     const texById   = new Map(); // id → { relativeFilename }
     for (const obj of objectsNode.children) {
         const id = obj.props[0];
         if (obj.name === 'Geometry' && obj.props[2] === 'Mesh') geoById.set(id, obj);
-        if (obj.name === 'Model'    && obj.props[2] === 'Mesh') modelById.set(id, obj);
+        if (obj.name === 'Model') {
+            allModelById.set(id, obj);
+            if (obj.props[2] === 'Mesh') modelById.set(id, obj);
+        }
         if (obj.name === 'Material') matById.set(id, obj);
         if (obj.name === 'Texture') {
             const relFn = prop0(findNode(obj.children, 'RelativeFilename'));
@@ -327,18 +407,34 @@ async function loadFBX(url, scene) {
     }
 
     // Build connection maps
-    const geoToModel  = new Map(); // geoId  → modelId
-    const modelToMat  = new Map(); // modelId → matId  (first match)
-    const matToTex    = new Map(); // matId   → texId  (first match)
+    const geoToModel   = new Map(); // geoId  → modelId
+    const modelToMat   = new Map(); // modelId → matId  (first match)
+    const matToTex     = new Map(); // matId   → texId  (first match)
+    const nodeToParent = new Map(); // nodeId  → parentId (OO; 0 = scene root)
     for (const c of connList) {
         if (geoById.has(c.from) && modelById.has(c.to)) geoToModel.set(c.from, c.to);
-        if (matById.has(c.from) && modelById.has(c.to) && !modelToMat.has(c.to))  modelToMat.set(c.to, c.from);
-        if (texById.has(c.from) && matById.has(c.to)   && !matToTex.has(c.to))    matToTex.set(c.to, c.from);
+        if (matById.has(c.from) && modelById.has(c.to) && !modelToMat.has(c.to)) modelToMat.set(c.to, c.from);
+        if (texById.has(c.from) && matById.has(c.to)   && !matToTex.has(c.to))   matToTex.set(c.to, c.from);
+        if (c.type === 'OO' && allModelById.has(c.from) && !nodeToParent.has(c.from)) {
+            nodeToParent.set(c.from, c.to);
+        }
     }
 
     console.log(`[FBX] Geometries: ${geoById.size}, Models: ${modelById.size}, Materials: ${matById.size}, Textures: ${texById.size}`);
 
-    const createdMeshes = [];
+    function applyFbxTransform(bjsNode, fbxModelNode) {
+        const { T, R, S, preR, rotOrder, geoT, geoR, geoS } = getModelTransform(fbxModelNode);
+        bjsNode.position.set(T[0], T[1], -T[2]);
+        // FBX total rotation = M_preR × M_LclR; in BJS q1.multiply(q2)=M_q1×M_q2, so preR goes first.
+        // PreRotation is always XYZ (order 0) per FBX spec; LclRotation uses the node's rotOrder.
+        bjsNode.rotationQuaternion = fbxEulerToQuat(preR, 0).multiply(fbxEulerToQuat(R, rotOrder));
+        bjsNode.scaling.set(S[0], S[1], S[2]);
+        return { T, R, S, preR, rotOrder, geoT, geoR, geoS };
+    }
+
+    const bjsNodeById     = new Map();
+    const allCreatedNodes = [];
+    const createdMeshes   = [];
     for (const [geoId, geoNode] of geoById) {
         const modelId   = geoToModel.get(geoId);
         const modelNode = modelId !== undefined ? modelById.get(modelId) : null;
@@ -348,21 +444,15 @@ async function loadFBX(url, scene) {
         const meshName = rawName.split('\0')[0].replace(/Model$/, '') || `mesh_${geoId}`;
 
         console.log(`[FBX] Building mesh: ${meshName}`);
-        const vd   = buildVertexData(geoNode);
+        const modelTransform = modelNode ? getModelTransform(modelNode) : null;
+        const geometryTransform = modelTransform ? makeGeometryTransform(modelTransform) : null;
+        const vd   = buildVertexData(geoNode, geometryTransform);
         const mesh = new BABYLON.Mesh(meshName, scene);
         vd.applyToMesh(mesh);
 
-        // Transform
         if (modelNode) {
-            const { T, R, S, preR } = getModelTransform(modelNode);
-            console.log(`[FBX] ${meshName} T=${JSON.stringify(T)} R=${JSON.stringify(R)} preR=${JSON.stringify(preR)} S=${JSON.stringify(S)}`);
-            mesh.position.set(T[0], T[1], -T[2]);
-            // FBX order: PreRotation then LclRotation.
-            // lclQ.multiply(preQ) = Q_lcl * Q_pre → applies preR first, then R.
-            const preQ = fbxEulerToQuat(preR);
-            const lclQ = fbxEulerToQuat(R);
-            mesh.rotationQuaternion = lclQ.multiply(preQ);
-            mesh.scaling.set(S[0], S[1], S[2]);
+            const { T, R, S, preR, rotOrder, geoT, geoR, geoS } = applyFbxTransform(mesh, modelNode);
+            console.log(`[FBX] ${meshName} T=${JSON.stringify(T)} R=${JSON.stringify(R)} preR=${JSON.stringify(preR)} rotOrder=${rotOrder} S=${JSON.stringify(S)} geoT=${JSON.stringify(geoT)} geoR=${JSON.stringify(geoR)} geoS=${JSON.stringify(geoS)}`);
         }
 
         // Material
@@ -383,11 +473,80 @@ async function loadFBX(url, scene) {
         }
         mesh.material = mat;
 
+        if (modelId !== undefined) bjsNodeById.set(modelId, mesh);
         createdMeshes.push(mesh);
+        allCreatedNodes.push(mesh);
     }
 
-    console.log(`[FBX] Done — created ${createdMeshes.length} mesh(es)`);
-    return createdMeshes;
+    // Pass 2: create TransformNodes for non-Mesh ancestors of Mesh nodes
+    const seenIds = new Set(bjsNodeById.keys());
+    for (const meshModelId of [...bjsNodeById.keys()]) {
+        let parentId = nodeToParent.get(meshModelId);
+        while (parentId && parentId !== 0 && !seenIds.has(parentId)) {
+            seenIds.add(parentId);
+            const parentFbxNode = allModelById.get(parentId);
+            if (parentFbxNode) {
+                const rawName  = parentFbxNode.props[1] ?? '';
+                const nodeName = rawName.split('\0')[0].replace(/Model$/, '') || `node_${parentId}`;
+                const tn = new BABYLON.TransformNode(nodeName, scene);
+                const { T, R, preR, rotOrder } = applyFbxTransform(tn, parentFbxNode);
+                console.log(`[FBX] TransformNode: ${nodeName} T=${JSON.stringify(T)} R=${JSON.stringify(R)} preR=${JSON.stringify(preR)} rotOrder=${rotOrder}`);
+                bjsNodeById.set(parentId, tn);
+                allCreatedNodes.push(tn);
+            }
+            parentId = nodeToParent.get(parentId);
+        }
+    }
+
+    // Pass 3: wire parent-child relationships
+    for (const [nodeId, bjsNode] of bjsNodeById) {
+        const parentId = nodeToParent.get(nodeId);
+        if (parentId && parentId !== 0) {
+            const parentBjsNode = bjsNodeById.get(parentId);
+            if (parentBjsNode) bjsNode.parent = parentBjsNode;
+        }
+    }
+
+    // Pass 4: wrap all FBX-root-level nodes in a single modelRoot.
+    // This ensures scaleInPlace() in the caller scales positions uniformly
+    // (Bip001.position=[0, 0.937, 0] must be multiplied by scale, not left as-is).
+    const modelRoot = new BABYLON.TransformNode('__model_root__', scene);
+    for (const bjsNode of bjsNodeById.values()) {
+        if (!bjsNode.parent) bjsNode.parent = modelRoot;
+    }
+    allCreatedNodes.push(modelRoot);
+
+    console.log(`[FBX] Done — created ${allCreatedNodes.length} node(s) (${createdMeshes.length} mesh(es))`);
+
+    // Debug: log world transforms of entire hierarchy (positions are pre-scale, in FBX units)
+    (function debugWorldTransforms() {
+        const f4 = v => v.toFixed(4);
+        const deg = v => BABYLON.Tools.ToDegrees(v).toFixed(2);
+        function traverse(node, depth) {
+            node.computeWorldMatrix(true);
+            const wm = node.getWorldMatrix();
+            const wPos = new BABYLON.Vector3(), wRot = new BABYLON.Quaternion(), wSc = new BABYLON.Vector3();
+            wm.decompose(wSc, wRot, wPos);
+            const e = wRot.toEulerAngles();
+            const lp = node.position;
+            const lq = node.rotationQuaternion;
+            const le = lq ? lq.toEulerAngles() : null;
+            const pad = '  '.repeat(depth);
+            console.log(
+                `${pad}[${node.name}]` +
+                ` lPos=[${f4(lp.x)},${f4(lp.y)},${f4(lp.z)}]` +
+                (le ? ` lEul=[${deg(le.x)},${deg(le.y)},${deg(le.z)}]°` : '') +
+                ` | wPos=[${f4(wPos.x)},${f4(wPos.y)},${f4(wPos.z)}]` +
+                ` wEul=[${deg(e.x)},${deg(e.y)},${deg(e.z)}]°`
+            );
+            for (const child of node.getChildren()) traverse(child, depth + 1);
+        }
+        console.log('[FBX] === World transforms (pre-caller-scale) ===');
+        traverse(modelRoot, 0);
+        console.log('[FBX] ==========================================');
+    })();
+
+    return allCreatedNodes;
 }
 
 // Expose globally (for use in index.js and Babylon.js Playground)
