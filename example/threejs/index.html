@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>three.js + FBX Example</title>
+  <link rel="stylesheet" type="text/css" href="style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.184.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+
+<div id="ui">
+  <select id="modelSelect"></select>
+</div>
+<div id="status"></div>
+<canvas id="c"></canvas>
+
+<script type="module" src="index.js"></script>
+</body>
+</html>

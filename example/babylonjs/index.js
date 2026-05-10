@@ -46,11 +46,15 @@ async function loadModel(name) {
         const meshes = await FBXLoader.loadFBX(url, scene);
 
         const scale = SCALES.get(name) ?? 1;
-        if (scale !== 1) meshes.forEach(m => m.scaling.scaleInPlace(scale));
+        if (scale !== 1) {
+            // Only scale root nodes; children inherit scale through the hierarchy
+            meshes.filter(m => !meshes.includes(m.parent)).forEach(m => m.scaling.scaleInPlace(scale));
+        }
 
         importedMeshes = meshes;
 
-        const msg = `${name} — meshes: ${meshes.length}`;
+        const meshCount = meshes.filter(m => m instanceof BABYLON.Mesh).length;
+        const msg = `${name} — meshes: ${meshCount}`;
         console.log(msg);
         setStatus(msg);
 
