@@ -1,6 +1,6 @@
 // fbx-loader.js
 // Binary FBX parser + Babylon.js mesh builder
-// Supports: static mesh, no skeleton, no animation (Phase 1)
+// Supports: static mesh and basic skinning, no animation playback (Phase 1)
 
 // ============================================================
 // Binary Reader
@@ -155,7 +155,7 @@ function parseProps70(node) {
 // ============================================================
 // Build Babylon.js VertexData from FBX Geometry node
 // ============================================================
-function buildVertexData(geoNode, geometryTransform = null) {
+function buildVertexData(geoNode, geometryTransform = null, skinWeightsByVertex = null) {
     const verts    = prop0(findNode(geoNode.children, 'Vertices'));
     const polyIdx  = prop0(findNode(geoNode.children, 'PolygonVertexIndex'));
     if (!verts || !polyIdx) throw new Error('Geometry missing Vertices or PolygonVertexIndex');
@@ -191,6 +191,7 @@ function buildVertexData(geoNode, geometryTransform = null) {
     // --- Triangulate polygons ---
     // PolygonVertexIndex: negative value = end of polygon, actual index = ~v
     const positions = [], normals = [], uvs = [], colors = [], indices = [];
+    const matricesIndices = [], matricesWeights = [];
     let vertexCount = 0;
     let pvGlobal = 0; // running polygon-vertex counter
     let polyGlobal = 0;
@@ -222,6 +223,12 @@ function buildVertexData(geoNode, geometryTransform = null) {
                     ? applyGeometryTransformToPoint(px, py, pz, geometryTransform)
                     : [px, py, pz];
                 positions.push(p[0], p[1], p[2]);
+
+                if (skinWeightsByVertex) {
+                    const skin = getSkinInfluencesForVertex(skinWeightsByVertex[posI]);
+                    matricesIndices.push(skin.indices[0], skin.indices[1], skin.indices[2], skin.indices[3]);
+                    matricesWeights.push(skin.weights[0], skin.weights[1], skin.weights[2], skin.weights[3]);
+                }
 
                 // Normal (negate Z)
                 if (normVals) {
@@ -270,7 +277,29 @@ function buildVertexData(geoNode, geometryTransform = null) {
     if (normals.length) vd.normals = normals;
     if (uvs.length)     vd.uvs     = uvs;
     if (colors.length)  vd.colors  = colors;
+    if (matricesIndices.length) vd.matricesIndices = matricesIndices;
+    if (matricesWeights.length) vd.matricesWeights = matricesWeights;
     return vd;
+}
+
+function getSkinInfluencesForVertex(influences) {
+    if (!influences || !influences.length) {
+        return { indices: [0, 0, 0, 0], weights: [1, 0, 0, 0] };
+    }
+
+    const sorted = influences
+        .slice()
+        .sort((a, b) => b.weight - a.weight)
+        .slice(0, 4);
+
+    const total = sorted.reduce((sum, item) => sum + item.weight, 0) || 1;
+    const indices = [0, 0, 0, 0];
+    const weights = [0, 0, 0, 0];
+    for (let i = 0; i < sorted.length; i++) {
+        indices[i] = sorted[i].boneIndex;
+        weights[i] = sorted[i].weight / total;
+    }
+    return { indices, weights };
 }
 
 // ============================================================
@@ -361,6 +390,14 @@ function applyGeometryTransformToNormal(x, y, z, transform) {
     return [r[0] / len, r[1] / len, r[2] / len];
 }
 
+function makeBabylonLocalMatrix(modelNode) {
+    const { T, R, S, preR, rotOrder } = getModelTransform(modelNode);
+    const position = new BABYLON.Vector3(T[0], T[1], -T[2]);
+    const rotation = fbxEulerToQuat(preR, 0).multiply(fbxEulerToQuat(R, rotOrder));
+    const scaling = new BABYLON.Vector3(S[0], S[1], S[2]);
+    return BABYLON.Matrix.Compose(scaling, rotation, position);
+}
+
 // ============================================================
 // Main: load FBX URL and build Babylon.js meshes
 // ============================================================
@@ -391,6 +428,8 @@ async function loadFBX(url, scene) {
     const modelById    = new Map(); // Mesh-type Model nodes
     const allModelById = new Map(); // ALL Model nodes (Mesh, LimbNode, Null, ...)
     const matById      = new Map();
+    const skinById     = new Map();
+    const clusterById  = new Map();
     const texById   = new Map(); // id → { relativeFilename }
     for (const obj of objectsNode.children) {
         const id = obj.props[0];
@@ -400,6 +439,8 @@ async function loadFBX(url, scene) {
             if (obj.props[2] === 'Mesh') modelById.set(id, obj);
         }
         if (obj.name === 'Material') matById.set(id, obj);
+        if (obj.name === 'Deformer' && obj.props[2] === 'Skin') skinById.set(id, obj);
+        if (obj.name === 'Deformer' && obj.props[2] === 'Cluster') clusterById.set(id, obj);
         if (obj.name === 'Texture') {
             const relFn = prop0(findNode(obj.children, 'RelativeFilename'));
             if (relFn) texById.set(id, { relativeFilename: relFn.replace(/\\/g, '/') });
@@ -411,16 +452,25 @@ async function loadFBX(url, scene) {
     const modelToMat   = new Map(); // modelId → matId  (first match)
     const matToTex     = new Map(); // matId   → texId  (first match)
     const nodeToParent = new Map(); // nodeId  → parentId (OO; 0 = scene root)
+    const geoToSkin    = new Map(); // geoId   → skinId
+    const skinToClusters = new Map(); // skinId → clusterId[]
+    const clusterToBoneModel = new Map(); // clusterId → modelId
     for (const c of connList) {
         if (geoById.has(c.from) && modelById.has(c.to)) geoToModel.set(c.from, c.to);
         if (matById.has(c.from) && modelById.has(c.to) && !modelToMat.has(c.to)) modelToMat.set(c.to, c.from);
         if (texById.has(c.from) && matById.has(c.to)   && !matToTex.has(c.to))   matToTex.set(c.to, c.from);
+        if (skinById.has(c.from) && geoById.has(c.to)) geoToSkin.set(c.to, c.from);
+        if (clusterById.has(c.from) && skinById.has(c.to)) {
+            if (!skinToClusters.has(c.to)) skinToClusters.set(c.to, []);
+            skinToClusters.get(c.to).push(c.from);
+        }
+        if (allModelById.has(c.from) && clusterById.has(c.to)) clusterToBoneModel.set(c.to, c.from);
         if (c.type === 'OO' && allModelById.has(c.from) && !nodeToParent.has(c.from)) {
             nodeToParent.set(c.from, c.to);
         }
     }
 
-    console.log(`[FBX] Geometries: ${geoById.size}, Models: ${modelById.size}, Materials: ${matById.size}, Textures: ${texById.size}`);
+    console.log(`[FBX] Geometries: ${geoById.size}, Models: ${modelById.size}, Materials: ${matById.size}, Textures: ${texById.size}, Skins: ${skinById.size}`);
 
     function applyFbxTransform(bjsNode, fbxModelNode) {
         const { T, R, S, preR, rotOrder, geoT, geoR, geoS } = getModelTransform(fbxModelNode);
@@ -432,9 +482,89 @@ async function loadFBX(url, scene) {
         return { T, R, S, preR, rotOrder, geoT, geoR, geoS };
     }
 
+    function createSkeletonForSkin(skinId, nameHint) {
+        const clusterIds = skinToClusters.get(skinId) ?? [];
+        const boneModelIds = [];
+        const clusterByBoneModelId = new Map();
+
+        for (const clusterId of clusterIds) {
+            const boneModelId = clusterToBoneModel.get(clusterId);
+            if (boneModelId === undefined || !allModelById.has(boneModelId)) continue;
+            if (!clusterByBoneModelId.has(boneModelId)) boneModelIds.push(boneModelId);
+            clusterByBoneModelId.set(boneModelId, clusterId);
+        }
+
+        if (!boneModelIds.length) return null;
+
+        const boneModelSet = new Set(boneModelIds);
+        const childrenByBoneId = new Map();
+        const rootBoneIds = [];
+        for (const boneModelId of boneModelIds) {
+            const parentId = nodeToParent.get(boneModelId);
+            if (boneModelSet.has(parentId)) {
+                if (!childrenByBoneId.has(parentId)) childrenByBoneId.set(parentId, []);
+                childrenByBoneId.get(parentId).push(boneModelId);
+            } else {
+                rootBoneIds.push(boneModelId);
+            }
+        }
+
+        const orderedBoneIds = [];
+        const visited = new Set();
+        function visit(boneModelId) {
+            if (visited.has(boneModelId)) return;
+            visited.add(boneModelId);
+            orderedBoneIds.push(boneModelId);
+            for (const childId of childrenByBoneId.get(boneModelId) ?? []) visit(childId);
+        }
+        for (const rootBoneId of rootBoneIds) visit(rootBoneId);
+        for (const boneModelId of boneModelIds) visit(boneModelId);
+
+        const skeleton = new BABYLON.Skeleton(`${nameHint}_skeleton`, `${nameHint}_skeleton`, scene);
+        const boneByModelId = new Map();
+        const boneIndexByModelId = new Map();
+        for (const boneModelId of orderedBoneIds) {
+            const boneModelNode = allModelById.get(boneModelId);
+            const rawName = boneModelNode.props[1] ?? '';
+            const boneName = rawName.split('\0')[0].replace(/Model$/, '') || `bone_${boneModelId}`;
+            const parentBone = boneByModelId.get(nodeToParent.get(boneModelId)) ?? null;
+            const bone = new BABYLON.Bone(boneName, skeleton, parentBone, makeBabylonLocalMatrix(boneModelNode));
+            boneByModelId.set(boneModelId, bone);
+            boneIndexByModelId.set(boneModelId, skeleton.bones.length - 1);
+        }
+
+        return { skeleton, boneIndexByModelId, clusterByBoneModelId };
+    }
+
+    function buildSkinWeightsByVertex(geoNode, skinInfo) {
+        if (!skinInfo) return null;
+        const verts = prop0(findNode(geoNode.children, 'Vertices'));
+        if (!verts) return null;
+        const weightsByVertex = Array.from({ length: verts.length / 3 }, () => []);
+
+        for (const [boneModelId, clusterId] of skinInfo.clusterByBoneModelId) {
+            const clusterNode = clusterById.get(clusterId);
+            const vertexIndices = prop0(findNode(clusterNode.children, 'Indexes')) ?? [];
+            const weights = prop0(findNode(clusterNode.children, 'Weights')) ?? [];
+            const boneIndex = skinInfo.boneIndexByModelId.get(boneModelId);
+            if (boneIndex === undefined) continue;
+
+            for (let i = 0; i < vertexIndices.length; i++) {
+                const vertexIndex = vertexIndices[i];
+                const weight = weights[i] ?? 0;
+                if (weight > 0 && weightsByVertex[vertexIndex]) {
+                    weightsByVertex[vertexIndex].push({ boneIndex, weight });
+                }
+            }
+        }
+
+        return weightsByVertex;
+    }
+
     const bjsNodeById     = new Map();
     const allCreatedNodes = [];
     const createdMeshes   = [];
+    const skinInfoBySkinId = new Map();
     for (const [geoId, geoNode] of geoById) {
         const modelId   = geoToModel.get(geoId);
         const modelNode = modelId !== undefined ? modelById.get(modelId) : null;
@@ -446,9 +576,20 @@ async function loadFBX(url, scene) {
         console.log(`[FBX] Building mesh: ${meshName}`);
         const modelTransform = modelNode ? getModelTransform(modelNode) : null;
         const geometryTransform = modelTransform ? makeGeometryTransform(modelTransform) : null;
-        const vd   = buildVertexData(geoNode, geometryTransform);
+        const skinId = geoToSkin.get(geoId);
+        let skinInfo = null;
+        if (skinId !== undefined) {
+            if (!skinInfoBySkinId.has(skinId)) skinInfoBySkinId.set(skinId, createSkeletonForSkin(skinId, meshName));
+            skinInfo = skinInfoBySkinId.get(skinId);
+        }
+        const skinWeightsByVertex = buildSkinWeightsByVertex(geoNode, skinInfo);
+        const vd   = buildVertexData(geoNode, geometryTransform, skinWeightsByVertex);
         const mesh = new BABYLON.Mesh(meshName, scene);
         vd.applyToMesh(mesh);
+        if (skinInfo?.skeleton) {
+            mesh.skeleton = skinInfo.skeleton;
+            console.log(`[FBX] ${meshName} skin bones=${skinInfo.skeleton.bones.length}`);
+        }
 
         if (modelNode) {
             const { T, R, S, preR, rotOrder, geoT, geoR, geoS } = applyFbxTransform(mesh, modelNode);
@@ -462,6 +603,16 @@ async function loadFBX(url, scene) {
         const matId   = modelId !== undefined ? modelToMat.get(modelId) : undefined;
         const texId   = matId   !== undefined ? matToTex.get(matId)     : undefined;
         const texInfo = texId   !== undefined ? texById.get(texId)       : undefined;
+        const matNode = matId   !== undefined ? matById.get(matId)       : undefined;
+        const matProps = matNode ? parseProps70(findNode(matNode.children, 'Properties70')) : null;
+        const diffuseColor = matProps?.get('Diffuse') ?? matProps?.get('DiffuseColor');
+        const specularColor = matProps?.get('Specular') ?? matProps?.get('SpecularColor');
+        if (Array.isArray(diffuseColor) && diffuseColor.length >= 3) {
+            mat.diffuseColor = new BABYLON.Color3(diffuseColor[0], diffuseColor[1], diffuseColor[2]);
+        }
+        if (Array.isArray(specularColor) && specularColor.length >= 3) {
+            mat.specularColor = new BABYLON.Color3(specularColor[0], specularColor[1], specularColor[2]);
+        }
 
         if (texInfo) {
             const texUrl = baseDir + texInfo.relativeFilename;

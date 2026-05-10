@@ -43,6 +43,12 @@ function getInitialModel() {
     return ASSETS.includes(model) ? model : 'vCube';
 }
 
+function getAnimationEnabled() {
+    const params = new URLSearchParams(window.location.search);
+    const value = params.get('animation') ?? params.get('anim');
+    return !['0', 'false', 'off', 'no'].includes((value ?? '').toLowerCase());
+}
+
 function disposeObject(object) {
     object.traverse(child => {
         if (child.isSkinnedMesh && child.skeleton) child.skeleton.dispose();
@@ -101,7 +107,7 @@ async function loadModel(name) {
             }
         });
 
-        const clip = selectDefaultClip(object);
+        const clip = getAnimationEnabled() ? selectDefaultClip(object) : null;
         if (clip) {
             mixer = new THREE.AnimationMixer(object);
             mixer.clipAction(clip).play();
