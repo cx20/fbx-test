@@ -31,6 +31,11 @@ function setStatus(msg) {
     document.getElementById('status').textContent = msg;
 }
 
+function getInitialModel() {
+    const model = new URLSearchParams(window.location.search).get('model');
+    return ASSETS.includes(model) ? model : 'vCube';
+}
+
 async function loadModel(name) {
     if (isLoading) return;
     isLoading = true;
@@ -88,12 +93,13 @@ async function init() {
 
     // プルダウン初期化
     const select = document.getElementById('modelSelect');
+    const initialModel = getInitialModel();
     ASSETS.forEach(name => {
         const opt = document.createElement('option');
         opt.value = name;
         opt.textContent = name;
         // vCube を初期選択
-        if (name === 'vCube') opt.selected = true;
+        if (name === initialModel) opt.selected = true;
         select.appendChild(opt);
     });
     select.addEventListener('change', () => loadModel(select.value));
@@ -101,8 +107,8 @@ async function init() {
     engine.runRenderLoop(() => scene.render());
     window.addEventListener('resize', () => engine.resize());
 
-    // vCube を最初に読み込む
-    await loadModel('vCube');
+    // 初期モデルを読み込む
+    await loadModel(initialModel);
 }
 
 init();

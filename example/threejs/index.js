@@ -38,6 +38,11 @@ function setStatus(msg) {
     document.getElementById('status').textContent = msg;
 }
 
+function getInitialModel() {
+    const model = new URLSearchParams(window.location.search).get('model');
+    return ASSETS.includes(model) ? model : 'vCube';
+}
+
 function disposeObject(object) {
     object.traverse(child => {
         if (child.isSkinnedMesh && child.skeleton) child.skeleton.dispose();
@@ -166,11 +171,12 @@ function init() {
     loader = new FBXLoader();
 
     const select = document.getElementById('modelSelect');
+    const initialModel = getInitialModel();
     ASSETS.forEach(name => {
         const opt = document.createElement('option');
         opt.value = name;
         opt.textContent = name;
-        if (name === 'vCube') opt.selected = true;
+        if (name === initialModel) opt.selected = true;
         select.appendChild(opt);
     });
     select.addEventListener('change', () => loadModel(select.value));
@@ -178,7 +184,7 @@ function init() {
     window.addEventListener('resize', onResize);
     renderer.setAnimationLoop(animate);
 
-    loadModel('vCube');
+    loadModel(initialModel);
 }
 
 function onResize() {
