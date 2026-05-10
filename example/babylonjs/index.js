@@ -23,7 +23,7 @@ const SCALES = new Map([
 
 const FBX_BASE = '../../assets/models/fbx/';
 
-let engine, scene, canvas;
+let engine, scene, canvas, camera;
 let importedMeshes = [];
 let isLoading = false;
 
@@ -34,6 +34,31 @@ function setStatus(msg) {
 function getInitialModel() {
     const model = new URLSearchParams(window.location.search).get('model');
     return ASSETS.includes(model) ? model : 'vCube';
+}
+
+function frameModel(nodes) {
+    const meshes = nodes.filter(node => node instanceof BABYLON.Mesh);
+    if (!meshes.length) return;
+
+    let min = null;
+    let max = null;
+    for (const mesh of meshes) {
+        mesh.computeWorldMatrix(true);
+        const bounds = mesh.getBoundingInfo().boundingBox;
+        const bMin = bounds.minimumWorld;
+        const bMax = bounds.maximumWorld;
+        min = min
+            ? BABYLON.Vector3.Minimize(min, bMin)
+            : bMin.clone();
+        max = max
+            ? BABYLON.Vector3.Maximize(max, bMax)
+            : bMax.clone();
+    }
+
+    const center = min.add(max).scale(0.5);
+    const size = max.subtract(min).length();
+    camera.target.copyFrom(center);
+    camera.radius = Math.max(size * 1.25, 1);
 }
 
 async function loadModel(name) {
@@ -57,6 +82,7 @@ async function loadModel(name) {
         }
 
         importedMeshes = meshes;
+        frameModel(meshes);
 
         const meshCount = meshes.filter(m => m instanceof BABYLON.Mesh).length;
         const msg = `${name} — meshes: ${meshCount}`;
@@ -78,7 +104,7 @@ async function init() {
     scene = new BABYLON.Scene(engine);
     scene.clearColor = new BABYLON.Color4(0.5, 0.5, 0.5, 1);
 
-    const camera = new BABYLON.ArcRotateCamera(
+    camera = new BABYLON.ArcRotateCamera(
         'camera', -Math.PI / 2, Math.PI / 2.5, 10,
         BABYLON.Vector3.Zero(), scene
     );
