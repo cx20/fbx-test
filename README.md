@@ -26,7 +26,7 @@ Legend:
 | [vCube](assets/models/fbx/vCube.fbx) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/threejs/index.html?model=vCube) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/babylonjs/index.html?model=vCube) | Static mesh. |
 | [archer/ArcherRi01](assets/models/fbx/archer/ArcherRi01.fbx) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/threejs/index.html?model=archer/ArcherRi01) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/babylonjs/index.html?model=archer/ArcherRi01) | Static mesh with geometric transform. |
 | [warrior/Warrior](assets/models/fbx/warrior/Warrior.fbx) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/threejs/index.html?model=warrior/Warrior) | :warning: [Sample](https://cx20.github.io/fbx-test/example/babylonjs/index.html?model=warrior/Warrior) | Skinned animation model. ByVertice UV/normal mapping fix applied. |
-| [stanford-bunny](assets/models/fbx/stanford-bunny.fbx) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/threejs/index.html?model=stanford-bunny) | :warning: [Sample](https://cx20.github.io/fbx-test/example/babylonjs/index.html?model=stanford-bunny) | Large static mesh; texture/material coverage is limited. |
+| [stanford-bunny](assets/models/fbx/stanford-bunny.fbx) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/threejs/index.html?model=stanford-bunny) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/babylonjs/index.html?model=stanford-bunny) | Large static mesh (ASCII FBX format). |
 | [mixamo](assets/models/fbx/mixamo.fbx) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/threejs/index.html?model=mixamo) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/babylonjs/index.html?model=mixamo) | Skinned animation model. |
 | [RotationTest](assets/models/fbx/RotationTest.fbx) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/threejs/index.html?model=RotationTest) | :warning: [Sample](https://cx20.github.io/fbx-test/example/babylonjs/index.html?model=RotationTest) | Rotation-order coverage is still being verified. |
 | [exampleWindow](assets/models/fbx/exampleWindow.fbx) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/threejs/index.html?model=exampleWindow) | :white_check_mark: [Sample](https://cx20.github.io/fbx-test/example/babylonjs/index.html?model=exampleWindow) | Static mesh. |
@@ -35,7 +35,7 @@ Legend:
 
 ## fbx-loader.js Usage
 
-A standalone binary FBX parser and Babylon.js mesh builder. No build step or npm install required — just include it as a `<script>` tag.
+A standalone binary and ASCII FBX parser and Babylon.js mesh builder. No build step or npm install required — just include it as a `<script>` tag.
 
 ### Installation
 
@@ -133,11 +133,11 @@ The [example viewer](example/babylonjs/index.html) also accepts these query para
 
 ## Current Babylon.js Loader Scope
 
-The Babylon.js sample uses a custom binary FBX parser. It currently focuses on static mesh loading, transform hierarchy validation, basic skinning data, and sampled skeleton animation.
+The Babylon.js sample uses a custom FBX parser supporting both binary and ASCII formats. It currently focuses on static mesh loading, transform hierarchy validation, basic skinning data, and sampled skeleton animation.
 
 Supported or partially supported:
 
-- Binary FBX parsing
+- Binary and ASCII FBX parsing
 - Mesh geometry
 - Normals, UVs, vertex colors
 - Basic materials and external diffuse textures
@@ -149,4 +149,3 @@ Supported or partially supported:
 Not supported yet:
 
 - Morph targets
-- Embedded texture extraction
