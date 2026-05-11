@@ -475,6 +475,14 @@ function sampleCurveNode(channel, time, fallback) {
     ];
 }
 
+// Detect image MIME type from raw bytes (for embedded FBX textures)
+function detectImageMimeType(buffer) {
+    const b = new Uint8Array(buffer, 0, Math.min(4, buffer.byteLength));
+    if (b[0] === 0xFF && b[1] === 0xD8) return 'image/jpeg';
+    if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'image/png';
+    return 'image/png';
+}
+
 // ============================================================
 // Main: load FBX URL and build Babylon.js meshes
 // ============================================================
@@ -512,6 +520,7 @@ async function loadFBX(url, scene, options = {}) {
     const animCurveNodeById = new Map();
     const animCurveById = new Map();
     const texById   = new Map(); // id → { relativeFilename }
+    const videoById = new Map(); // id → ArrayBuffer (embedded image content)
     for (const obj of objectsNode.children) {
         const id = obj.props[0];
         if (obj.name === 'Geometry' && obj.props[2] === 'Mesh') geoById.set(id, obj);
@@ -527,15 +536,20 @@ async function loadFBX(url, scene, options = {}) {
         if (obj.name === 'AnimationCurveNode') animCurveNodeById.set(id, obj);
         if (obj.name === 'AnimationCurve') animCurveById.set(id, obj);
         if (obj.name === 'Texture') {
-            const relFn = prop0(findNode(obj.children, 'RelativeFilename'));
-            if (relFn) texById.set(id, { relativeFilename: relFn.replace(/\\/g, '/') });
+            const relFn = prop0(findNode(obj.children, 'RelativeFilename')) ?? '';
+            texById.set(id, { relativeFilename: relFn.replace(/\\/g, '/') });
+        }
+        if (obj.name === 'Video') {
+            const raw = findNode(obj.children, 'Content')?.props[0];
+            if (raw instanceof ArrayBuffer && raw.byteLength > 0) videoById.set(id, raw);
         }
     }
 
     // Build connection maps
     const geoToModel   = new Map(); // geoId  → modelId
-    const modelToMat   = new Map(); // modelId → matId  (first match)
+    const modelToMats  = new Map(); // modelId → matId[] (all materials in connection order)
     const matToTex     = new Map(); // matId   → texId  (first match)
+    const texToVideo   = new Map(); // texId   → videoId (embedded texture)
     const nodeToParent = new Map(); // nodeId  → parentId (OO; 0 = scene root)
     const geoToSkin    = new Map(); // geoId   → skinId
     const skinToClusters = new Map(); // skinId → clusterId[]
@@ -546,8 +560,12 @@ async function loadFBX(url, scene, options = {}) {
     const animCurvesByNode = new Map(); // curveNodeId → AnimationCurve[3]
     for (const c of connList) {
         if (geoById.has(c.from) && modelById.has(c.to)) geoToModel.set(c.from, c.to);
-        if (matById.has(c.from) && modelById.has(c.to) && !modelToMat.has(c.to)) modelToMat.set(c.to, c.from);
+        if (matById.has(c.from) && modelById.has(c.to)) {
+            if (!modelToMats.has(c.to)) modelToMats.set(c.to, []);
+            modelToMats.get(c.to).push(c.from);
+        }
         if (texById.has(c.from) && matById.has(c.to)   && !matToTex.has(c.to))   matToTex.set(c.to, c.from);
+        if (videoById.has(c.from) && texById.has(c.to)) texToVideo.set(c.to, c.from);
         if (skinById.has(c.from) && geoById.has(c.to)) geoToSkin.set(c.to, c.from);
         if (clusterById.has(c.from) && skinById.has(c.to)) {
             if (!skinToClusters.has(c.to)) skinToClusters.set(c.to, []);
@@ -571,7 +589,47 @@ async function loadFBX(url, scene, options = {}) {
         }
     }
 
-    console.log(`[FBX] Geometries: ${geoById.size}, Models: ${modelById.size}, Materials: ${matById.size}, Textures: ${texById.size}, Skins: ${skinById.size}, AnimationStacks: ${animStackById.size}`);
+    console.log(`[FBX] Geometries: ${geoById.size}, Models: ${modelById.size}, Materials: ${matById.size}, Textures: ${texById.size}, Videos: ${videoById.size}, Skins: ${skinById.size}, AnimationStacks: ${animStackById.size}`);
+
+    // Return the material index (into the per-model materials array) used by the most polygons.
+    // Parses LayerElementMaterial so multi-material meshes select their dominant material.
+    function getDominantMaterialIndex(geoNode) {
+        const lmNode = findNode(geoNode.children, 'LayerElementMaterial');
+        if (!lmNode) return 0;
+        const mapping   = prop0(findNode(lmNode.children, 'MappingInformationType')) ?? 'AllSame';
+        const matIndices = prop0(findNode(lmNode.children, 'Materials')) ?? [];
+        if (mapping === 'AllSame' || !matIndices.length) return matIndices[0] ?? 0;
+        const counts = new Map();
+        for (const idx of matIndices) counts.set(idx, (counts.get(idx) ?? 0) + 1);
+        let best = 0, bestCount = 0;
+        for (const [idx, count] of counts) {
+            if (count > bestCount) { best = idx; bestCount = count; }
+        }
+        return best;
+    }
+
+    function getTriangleMaterialIndices(geoNode) {
+        const lmNode = findNode(geoNode.children, 'LayerElementMaterial');
+        if (!lmNode) return null;
+        const mapping    = prop0(findNode(lmNode.children, 'MappingInformationType')) ?? 'AllSame';
+        const matIndices = prop0(findNode(lmNode.children, 'Materials')) ?? [];
+        if (mapping === 'AllSame' || !matIndices.length) return null;
+        const polyIdx = prop0(findNode(geoNode.children, 'PolygonVertexIndex')) ?? [];
+        const triMatIndices = [];
+        let polyGlobal = 0, polyLen = 0;
+        for (const v of polyIdx) {
+            polyLen++;
+            if (v < 0) {
+                if (polyLen >= 3) {
+                    const matIdx = matIndices[polyGlobal] ?? 0;
+                    for (let t = 0; t < polyLen - 2; t++) triMatIndices.push(matIdx);
+                }
+                polyLen = 0;
+                polyGlobal++;
+            }
+        }
+        return triMatIndices.length ? triMatIndices : null;
+    }
 
     function applyFbxTransform(bjsNode, fbxModelNode) {
         const { T, R, S, preR, rotOrder, geoT, geoR, geoS } = getModelTransform(fbxModelNode);
@@ -983,32 +1041,66 @@ async function loadFBX(url, scene, options = {}) {
         }
 
         // Material
-        const mat = new BABYLON.StandardMaterial(`${meshName}_mat`, scene);
-        mat.backFaceCulling = true;
+        const allMatIds = modelId !== undefined ? (modelToMats.get(modelId) ?? []) : [];
+        const hasVertexColors = !!(vd.colors?.length);
 
-        const matId   = modelId !== undefined ? modelToMat.get(modelId) : undefined;
-        const texId   = matId   !== undefined ? matToTex.get(matId)     : undefined;
-        const texInfo = texId   !== undefined ? texById.get(texId)       : undefined;
-        const matNode = matId   !== undefined ? matById.get(matId)       : undefined;
-        const matProps = matNode ? parseProps70(findNode(matNode.children, 'Properties70')) : null;
-        const diffuseColor = matProps?.get('Diffuse') ?? matProps?.get('DiffuseColor');
-        const specularColor = matProps?.get('Specular') ?? matProps?.get('SpecularColor');
-        if (Array.isArray(diffuseColor) && diffuseColor.length >= 3) {
-            mat.diffuseColor = new BABYLON.Color3(diffuseColor[0], diffuseColor[1], diffuseColor[2]);
-        }
-        if (Array.isArray(specularColor) && specularColor.length >= 3) {
-            mat.specularColor = new BABYLON.Color3(specularColor[0], specularColor[1], specularColor[2]);
+        function createBabylonMaterial(matId, matName) {
+            const mat = new BABYLON.StandardMaterial(matName, scene);
+            mat.backFaceCulling = true;
+            const texId    = matId !== undefined ? matToTex.get(matId)           : undefined;
+            const texInfo  = texId !== undefined ? texById.get(texId)            : undefined;
+            const matNode  = matId !== undefined ? matById.get(matId)            : undefined;
+            const matProps = matNode ? parseProps70(findNode(matNode.children, 'Properties70')) : null;
+            const diffuseColor  = matProps?.get('Diffuse')  ?? matProps?.get('DiffuseColor');
+            const specularColor = matProps?.get('Specular') ?? matProps?.get('SpecularColor');
+            if (Array.isArray(diffuseColor)  && diffuseColor.length  >= 3)
+                mat.diffuseColor  = new BABYLON.Color3(diffuseColor[0],  diffuseColor[1],  diffuseColor[2]);
+            if (Array.isArray(specularColor) && specularColor.length >= 3)
+                mat.specularColor = new BABYLON.Color3(specularColor[0], specularColor[1], specularColor[2]);
+            const videoContent = texId !== undefined ? videoById.get(texToVideo.get(texId)) : undefined;
+            if (videoContent) {
+                const mimeType = detectImageMimeType(videoContent);
+                const blobUrl = URL.createObjectURL(new Blob([videoContent], { type: mimeType }));
+                console.log(`[FBX] Embedded texture: ${mimeType} (${videoContent.byteLength} bytes)`);
+                mat.diffuseTexture = new BABYLON.Texture(blobUrl, scene);
+            } else if (texInfo?.relativeFilename) {
+                const texUrl = baseDir + texInfo.relativeFilename;
+                console.log(`[FBX] Texture: ${texUrl}`);
+                mat.diffuseTexture = new BABYLON.Texture(texUrl, scene);
+            } else if (hasVertexColors && !Array.isArray(diffuseColor)) {
+                mat.vertexColorsEnabled = true;
+                mat.diffuseColor = new BABYLON.Color3(1, 1, 1);
+            }
+            return mat;
         }
 
-        if (texInfo) {
-            const texUrl = baseDir + texInfo.relativeFilename;
-            console.log(`[FBX] Texture: ${texUrl}`);
-            mat.diffuseTexture = new BABYLON.Texture(texUrl, scene);
-        } else if (vd.colors) {
-            mat.vertexColorsEnabled = true;
-            mat.diffuseColor = new BABYLON.Color3(1, 1, 1);
+        const triMatIndices  = getTriangleMaterialIndices(geoNode);
+        const uniqueMatIdxs  = triMatIndices ? [...new Set(triMatIndices)].sort((a, b) => a - b) : null;
+
+        if (uniqueMatIdxs && uniqueMatIdxs.length > 1 && allMatIds.length > 1) {
+            const matIdxToSubIdx = new Map(uniqueMatIdxs.map((mi, si) => [mi, si]));
+            const multiMat = new BABYLON.MultiMaterial(`${meshName}_multimat`, scene);
+            for (const matIdx of uniqueMatIdxs) {
+                multiMat.subMaterials.push(
+                    createBabylonMaterial(allMatIds[matIdx], `${meshName}_mat${matIdx}`)
+                );
+            }
+            mesh.material = multiMat;
+            mesh.subMeshes = [];
+            const totalVerts = vd.positions.length / 3;
+            let i = 0;
+            while (i < triMatIndices.length) {
+                const matIdx = triMatIndices[i];
+                let j = i + 1;
+                while (j < triMatIndices.length && triMatIndices[j] === matIdx) j++;
+                new BABYLON.SubMesh(matIdxToSubIdx.get(matIdx), 0, totalVerts, i * 3, (j - i) * 3, mesh);
+                i = j;
+            }
+        } else {
+            const dominantIdx = getDominantMaterialIndex(geoNode);
+            const matId = allMatIds[dominantIdx] ?? allMatIds[0];
+            mesh.material = createBabylonMaterial(matId, `${meshName}_mat`);
         }
-        mesh.material = mat;
 
         if (modelId !== undefined) bjsNodeById.set(modelId, mesh);
         createdMeshes.push(mesh);
