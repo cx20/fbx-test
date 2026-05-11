@@ -27,6 +27,8 @@ const SEARCH_PARAMS = new URLSearchParams(window.location.search);
 
 let engine, scene, canvas, camera;
 let importedMeshes = [];
+let gui, animationFolder, timeController;
+let activeAnimation = null;
 let isLoading = false;
 
 function setStatus(msg) {
@@ -45,6 +47,16 @@ function getCustomUrl() {
 
 function getInitialSelection() {
     return getCustomUrl() ? CUSTOM_URL_OPTION : getInitialModel();
+}
+
+function getAssetOptions() {
+    const options = {};
+    const customUrl = getCustomUrl();
+    if (customUrl) options[`Custom: ${getUrlFileName(customUrl)}`] = CUSTOM_URL_OPTION;
+    ASSETS.forEach(name => {
+        options[name] = name;
+    });
+    return options;
 }
 
 function getUrlFileName(url) {
@@ -73,6 +85,15 @@ function getAnimationTime() {
     const time = value === null ? NaN : Number(value);
     return Number.isFinite(time) ? time : null;
 }
+
+const PARAMS = {
+    asset: getInitialSelection(),
+    animate: getAnimationEnabled(),
+    fixedTime: getAnimationTime() !== null,
+    time: getAnimationTime() ?? 0,
+    model: true,
+    debug: showDebugLayer,
+};
 
 function frameModel(nodes) {
     const meshes = nodes.filter(node => node instanceof BABYLON.Mesh);
@@ -109,6 +130,8 @@ async function loadModel(selection) {
     try {
         importedMeshes.forEach(m => m.dispose());
         importedMeshes = [];
+        activeAnimation = null;
+        rebuildAnimationFolder();
 
         const url = customUrl ?? (FBX_BASE + selection.split('/').map(encodeURIComponent).join('/') + '.fbx');
 
@@ -124,7 +147,10 @@ async function loadModel(selection) {
         }
 
         importedMeshes = meshes;
+        PARAMS.asset = selection;
         frameModel(meshes);
+        rebuildAnimationFolder();
+        setObjectVisibility();
 
         const meshCount = meshes.filter(m => m instanceof BABYLON.Mesh).length;
         const msg = `${name} — meshes: ${meshCount}`;
@@ -137,6 +163,71 @@ async function loadModel(selection) {
     } finally {
         isLoading = false;
     }
+}
+
+function getAnimationControls() {
+    const controls = [];
+    importedMeshes.forEach(node => {
+        const nodeControls = node.metadata?.fbxAnimationControls;
+        if (Array.isArray(nodeControls)) controls.push(...nodeControls);
+    });
+    return controls;
+}
+
+function rebuildAnimationFolder() {
+    [...animationFolder.children].forEach(child => child.destroy());
+    animationFolder.hide();
+
+    const animations = getAnimationControls();
+    activeAnimation = animations[0] ?? null;
+    if (!activeAnimation) return;
+
+    PARAMS.animate = activeAnimation.playing;
+    PARAMS.fixedTime = activeAnimation.fixedTime;
+    PARAMS.time = getAnimationTime() ?? activeAnimation.time;
+    animationFolder.show();
+    animationFolder.add(PARAMS, 'animate').name('play').onChange(value => {
+        activeAnimation?.setPlaying(value);
+    });
+    animationFolder.add(PARAMS, 'fixedTime').name('fixed time').onChange(value => {
+        activeAnimation?.setFixedTime(value);
+    });
+    timeController = animationFolder.add(PARAMS, 'time', 0, activeAnimation.duration, 0.01)
+        .name('time')
+        .onChange(value => {
+            activeAnimation?.setTime(value);
+        });
+    activeAnimation.setTime(PARAMS.time);
+    timeController.updateDisplay();
+}
+
+function setObjectVisibility() {
+    importedMeshes.forEach(node => {
+        if (node.parent && importedMeshes.includes(node.parent)) return;
+        node.setEnabled(PARAMS.model);
+    });
+}
+
+function showDebugLayer() {
+    if (!scene?.debugLayer) return;
+    if (scene.debugLayer.isVisible?.()) {
+        scene.debugLayer.hide();
+        return;
+    }
+
+    scene.debugLayer.show({
+        embedMode: true,
+        overlay: true,
+        handleResize: false,
+    });
+}
+
+function initGui() {
+    gui = new lil.GUI();
+    gui.add(PARAMS, 'asset', getAssetOptions()).name('asset').onChange(loadModel);
+    gui.add(PARAMS, 'model').name('model').onChange(setObjectVisibility);
+    animationFolder = gui.addFolder('Animation').hide();
+    gui.add(PARAMS, 'debug').name('Debug');
 }
 
 async function init() {
@@ -159,26 +250,8 @@ async function init() {
     const dir = new BABYLON.DirectionalLight('dir', new BABYLON.Vector3(-1, -2, -1), scene);
     dir.intensity = 0.7;
 
-    // プルダウン初期化
-    const select = document.getElementById('modelSelect');
-    const customUrl = getCustomUrl();
     const initialSelection = getInitialSelection();
-    if (customUrl) {
-        const opt = document.createElement('option');
-        opt.value = CUSTOM_URL_OPTION;
-        opt.textContent = `Custom: ${getUrlFileName(customUrl)}`;
-        opt.selected = true;
-        select.appendChild(opt);
-    }
-    ASSETS.forEach(name => {
-        const opt = document.createElement('option');
-        opt.value = name;
-        opt.textContent = name;
-        // vCube を初期選択
-        if (name === initialSelection) opt.selected = true;
-        select.appendChild(opt);
-    });
-    select.addEventListener('change', () => loadModel(select.value));
+    initGui();
 
     engine.runRenderLoop(() => scene.render());
     window.addEventListener('resize', () => engine.resize());

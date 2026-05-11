@@ -751,21 +751,40 @@ async function loadFBX(url, scene, options = {}) {
         if (typeof skinInfo.skeleton.prepare === 'function') skinInfo.skeleton.prepare();
     }
 
-    function startSkeletonAnimation(skinInfo, runtime) {
-        if (Number.isFinite(options.animationTime)) {
-            const fixedTime = runtime.start + (((options.animationTime % runtime.duration) + runtime.duration) % runtime.duration);
-            applySkeletonAnimation(skinInfo, runtime, fixedTime);
-            return null;
-        }
+    function createSkeletonAnimationControl(skinInfo, runtime) {
+        const control = {
+            name: runtime.name,
+            duration: runtime.duration,
+            time: 0,
+            playing: options.animation !== false,
+            fixedTime: Number.isFinite(options.animationTime),
+            observer: null,
+            setTime(time) {
+                this.time = ((time % runtime.duration) + runtime.duration) % runtime.duration;
+                runtime.elapsed = this.time;
+                applySkeletonAnimation(skinInfo, runtime, runtime.start + this.time);
+            },
+            setPlaying(playing) {
+                this.playing = playing;
+            },
+            setFixedTime(fixedTime) {
+                this.fixedTime = fixedTime;
+                if (fixedTime) this.setTime(this.time);
+            },
+            dispose() {
+                if (this.observer) scene.onBeforeRenderObservable.remove(this.observer);
+                this.observer = null;
+            },
+        };
 
-        applySkeletonAnimation(skinInfo, runtime, runtime.start);
-        const observer = scene.onBeforeRenderObservable.add(() => {
+        control.setTime(Number.isFinite(options.animationTime) ? options.animationTime : 0);
+        control.observer = scene.onBeforeRenderObservable.add(() => {
+            if (!control.playing || control.fixedTime) return;
             const engine = scene.getEngine?.();
             const delta = engine ? engine.getDeltaTime() / 1000 : 1 / 60;
-            runtime.elapsed = (runtime.elapsed + delta) % runtime.duration;
-            applySkeletonAnimation(skinInfo, runtime, runtime.start + runtime.elapsed);
+            control.setTime(control.time + delta);
         });
-        return observer;
+        return control;
     }
 
     const bjsNodeById     = new Map();
@@ -874,19 +893,21 @@ async function loadFBX(url, scene, options = {}) {
     }
     allCreatedNodes.push(modelRoot);
 
-    const animationObservers = [];
-    if (options.animation !== false) {
-        for (const skinInfo of skinInfoBySkinId.values()) {
-            const runtime = createSkeletonAnimationRuntime(skinInfo);
-            if (!runtime) continue;
-            const observer = startSkeletonAnimation(skinInfo, runtime);
-            if (observer) animationObservers.push(observer);
-            console.log(`[FBX] Animation: ${runtime.name} duration=${runtime.duration.toFixed(3)}s bones=${runtime.channelsByBoneModelId.size}`);
-        }
+    const animationControls = [];
+    for (const skinInfo of skinInfoBySkinId.values()) {
+        const runtime = createSkeletonAnimationRuntime(skinInfo);
+        if (!runtime) continue;
+        const control = createSkeletonAnimationControl(skinInfo, runtime);
+        animationControls.push(control);
+        console.log(`[FBX] Animation: ${runtime.name} duration=${runtime.duration.toFixed(3)}s bones=${runtime.channelsByBoneModelId.size}`);
     }
-    if (animationObservers.length && modelRoot.onDisposeObservable) {
+    modelRoot.metadata = {
+        ...(modelRoot.metadata ?? {}),
+        fbxAnimationControls: animationControls,
+    };
+    if (animationControls.length && modelRoot.onDisposeObservable) {
         modelRoot.onDisposeObservable.add(() => {
-            for (const observer of animationObservers) scene.onBeforeRenderObservable.remove(observer);
+            for (const control of animationControls) control.dispose();
         });
     }
 
