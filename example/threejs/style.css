@@ -1,13 +1,6 @@
-* {
-  margin: 0;
-  padding: 0;
-  border: 0;
-  box-sizing: border-box;
-}
-
 html,
-body,
-#c {
+body {
+  margin: 0;
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -18,22 +11,10 @@ body {
   font: 30px sans-serif;
 }
 
-#ui {
-  position: fixed;
-  top: 10px;
-  left: 10px;
-  z-index: 10;
-  width: auto;
-  height: auto;
-  overflow: visible;
-}
-
-#modelSelect {
-  width: auto;
-  height: auto;
-  font-size: 14px;
-  padding: 4px 8px;
-  cursor: pointer;
+#c {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 #status {

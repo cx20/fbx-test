@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 
@@ -26,12 +27,16 @@ const SCALES = new Map([
 ]);
 
 const FBX_BASE = '../../assets/models/fbx/';
+const SEARCH_PARAMS = new URLSearchParams(window.location.search);
 
-let renderer, scene, camera, controls, loader;
+let renderer, scene, camera, controls, loader, gui, morphsFolder, animationFolder;
+let ground, grid;
 let importedObject = null;
+let skeletonHelper = null;
 let mixer = null;
+let activeAction = null;
 let isLoading = false;
-const fixedAnimationTime = getAnimationTime();
+let clipController, timeController;
 const timer = new THREE.Timer();
 timer.connect(document);
 
@@ -40,21 +45,37 @@ function setStatus(msg) {
 }
 
 function getInitialModel() {
-    const model = new URLSearchParams(window.location.search).get('model');
+    const model = SEARCH_PARAMS.get('model');
     return ASSETS.includes(model) ? model : 'vCube';
 }
 
 function getAnimationEnabled() {
-    const params = new URLSearchParams(window.location.search);
-    const value = params.get('animation') ?? params.get('anim');
+    const value = SEARCH_PARAMS.get('animation') ?? SEARCH_PARAMS.get('anim');
     return !['0', 'false', 'off', 'no'].includes((value ?? '').toLowerCase());
 }
 
 function getAnimationTime() {
-    const value = new URLSearchParams(window.location.search).get('time');
+    const value = SEARCH_PARAMS.get('time');
     const time = value === null ? NaN : Number(value);
     return Number.isFinite(time) ? time : null;
 }
+
+function getScaleOverride() {
+    const scale = Number(SEARCH_PARAMS.get('scale'));
+    return Number.isFinite(scale) && scale > 0 ? scale : null;
+}
+
+const PARAMS = {
+    asset: getInitialModel(),
+    animate: getAnimationEnabled(),
+    fixedTime: getAnimationTime() !== null,
+    time: getAnimationTime() ?? 0,
+    clip: '',
+    model: true,
+    skeleton: false,
+    ground: true,
+    grid: true,
+};
 
 function disposeObject(object) {
     object.traverse(child => {
@@ -73,6 +94,14 @@ function disposeObject(object) {
     });
 }
 
+function disposeSkeletonHelper() {
+    if (!skeletonHelper) return;
+    scene.remove(skeletonHelper);
+    skeletonHelper.geometry?.dispose();
+    skeletonHelper.material?.dispose();
+    skeletonHelper = null;
+}
+
 function countMeshes(object) {
     let count = 0;
     object.traverse(child => {
@@ -81,10 +110,76 @@ function countMeshes(object) {
     return count;
 }
 
-function selectDefaultClip(object) {
+function getDefaultClip(object) {
     if (!object.animations.length) return null;
     console.log('[FBX] Animation clips:', object.animations.map(clip => clip.name).join(', '));
     return object.animations.find(clip => clip.name === 'idle') ?? object.animations[0];
+}
+
+function setActiveClip(clipName = PARAMS.clip) {
+    if (!mixer || !importedObject?.animations.length) return;
+
+    if (activeAction) {
+        activeAction.stop();
+        activeAction = null;
+    }
+
+    const clip = importedObject.animations.find(item => item.name === clipName) ?? importedObject.animations[0];
+    PARAMS.clip = clip.name;
+    activeAction = mixer.clipAction(clip);
+    activeAction.play();
+    applyAnimationTime();
+}
+
+function applyAnimationTime() {
+    if (mixer && PARAMS.fixedTime) {
+        mixer.setTime(PARAMS.time);
+    }
+}
+
+function setObjectVisibility() {
+    if (importedObject) importedObject.visible = PARAMS.model;
+    if (skeletonHelper) skeletonHelper.visible = PARAMS.skeleton;
+    if (ground) ground.visible = PARAMS.ground;
+    if (grid) grid.visible = PARAMS.grid;
+}
+
+function rebuildAnimationFolder(object) {
+    [...animationFolder.children].forEach(child => child.destroy());
+    animationFolder.hide();
+
+    if (!object.animations.length) return;
+
+    const clips = object.animations.map(clip => clip.name);
+    const defaultClip = getDefaultClip(object);
+    PARAMS.clip = defaultClip?.name ?? clips[0];
+    PARAMS.time = getAnimationTime() ?? 0;
+    animationFolder.show();
+    clipController = animationFolder.add(PARAMS, 'clip', clips).name('clip').onChange(setActiveClip);
+    animationFolder.add(PARAMS, 'animate').name('play').onChange(value => {
+        if (!value) applyAnimationTime();
+    });
+    animationFolder.add(PARAMS, 'fixedTime').name('fixed time').onChange(applyAnimationTime);
+    timeController = animationFolder.add(PARAMS, 'time', 0, Math.max(...object.animations.map(clip => clip.duration)), 0.01)
+        .name('time')
+        .onChange(applyAnimationTime);
+    clipController.updateDisplay();
+    timeController.updateDisplay();
+}
+
+function rebuildMorphsFolder(object) {
+    [...morphsFolder.children].forEach(child => child.destroy());
+    morphsFolder.hide();
+
+    object.traverse(child => {
+        if (!child.isMesh || !child.morphTargetDictionary) return;
+
+        morphsFolder.show();
+        const meshFolder = morphsFolder.addFolder(child.name || child.uuid);
+        Object.keys(child.morphTargetDictionary).forEach(key => {
+            meshFolder.add(child.morphTargetInfluences, child.morphTargetDictionary[key], 0, 1, 0.01).name(key);
+        });
+    });
 }
 
 async function loadModel(name) {
@@ -98,14 +193,17 @@ async function loadModel(name) {
             disposeObject(importedObject);
             importedObject = null;
         }
+        disposeSkeletonHelper();
         mixer = null;
+        activeAction = null;
 
         const fbxPath = name.split('/').map(encodeURIComponent).join('/');
         const url = FBX_BASE + fbxPath + '.fbx';
         const object = await loader.loadAsync(url);
 
-        const scale = SCALES.get(name);
-        object.scale.setScalar(scale || 1);
+        const scale = getScaleOverride() ?? SCALES.get(name) ?? 1;
+        PARAMS.asset = name;
+        object.scale.setScalar(scale);
 
         object.traverse(child => {
             if (child.isMesh) {
@@ -114,15 +212,22 @@ async function loadModel(name) {
             }
         });
 
-        const clip = getAnimationEnabled() ? selectDefaultClip(object) : null;
-        if (clip) {
+        importedObject = object;
+
+        if (object.animations.length) {
             mixer = new THREE.AnimationMixer(object);
-            mixer.clipAction(clip).play();
-            if (fixedAnimationTime !== null) mixer.setTime(fixedAnimationTime);
+            rebuildAnimationFolder(object);
+            setActiveClip(PARAMS.clip);
+        } else {
+            rebuildAnimationFolder(object);
         }
 
         scene.add(object);
-        importedObject = object;
+        skeletonHelper = new THREE.SkeletonHelper(object);
+        skeletonHelper.visible = PARAMS.skeleton;
+        scene.add(skeletonHelper);
+        rebuildMorphsFolder(object);
+        setObjectVisibility();
 
         const meshCount = countMeshes(object);
         const msg = `${name} — meshes: ${meshCount}`;
@@ -135,6 +240,17 @@ async function loadModel(name) {
     } finally {
         isLoading = false;
     }
+}
+
+function initGui() {
+    gui = new GUI();
+    gui.add(PARAMS, 'asset', ASSETS).name('asset').onChange(loadModel);
+    gui.add(PARAMS, 'model').name('model').onChange(setObjectVisibility);
+    gui.add(PARAMS, 'skeleton').name('skeleton').onChange(setObjectVisibility);
+    gui.add(PARAMS, 'ground').name('ground').onChange(setObjectVisibility);
+    gui.add(PARAMS, 'grid').name('grid').onChange(setObjectVisibility);
+    animationFolder = gui.addFolder('Animation').hide();
+    morphsFolder = gui.addFolder('Morphs').hide();
 }
 
 function init() {
@@ -165,7 +281,7 @@ function init() {
     dir.shadow.camera.right = 120;
     scene.add(dir);
 
-    const ground = new THREE.Mesh(
+    ground = new THREE.Mesh(
         new THREE.PlaneGeometry(2000, 2000),
         new THREE.MeshPhongMaterial({ color: 0x999999, depthWrite: false })
     );
@@ -173,7 +289,7 @@ function init() {
     ground.receiveShadow = true;
     scene.add(ground);
 
-    const grid = new THREE.GridHelper(2000, 20, 0x000000, 0x000000);
+    grid = new THREE.GridHelper(2000, 20, 0x000000, 0x000000);
     grid.material.opacity = 0.2;
     grid.material.transparent = true;
     scene.add(grid);
@@ -183,22 +299,12 @@ function init() {
     controls.update();
 
     loader = new FBXLoader();
-
-    const select = document.getElementById('modelSelect');
-    const initialModel = getInitialModel();
-    ASSETS.forEach(name => {
-        const opt = document.createElement('option');
-        opt.value = name;
-        opt.textContent = name;
-        if (name === initialModel) opt.selected = true;
-        select.appendChild(opt);
-    });
-    select.addEventListener('change', () => loadModel(select.value));
+    initGui();
 
     window.addEventListener('resize', onResize);
     renderer.setAnimationLoop(animate);
 
-    loadModel(initialModel);
+    loadModel(PARAMS.asset);
 }
 
 function onResize() {
@@ -210,7 +316,7 @@ function onResize() {
 function animate() {
     timer.update();
     const delta = timer.getDelta();
-    if (mixer && fixedAnimationTime === null) mixer.update(delta);
+    if (mixer && PARAMS.animate && !PARAMS.fixedTime) mixer.update(delta);
     controls.update();
     renderer.render(scene, camera);
 }
