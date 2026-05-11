@@ -1,6 +1,8 @@
 // fbx-loader.js
 // Binary FBX parser + Babylon.js mesh builder
-// Supports: static mesh and basic skinning, no animation playback (Phase 1)
+// Supports: static mesh, basic skinning, and sampled skeleton animation (Phase 1)
+
+const FBX_TIME_UNIT_SECONDS = 1 / 46186158000;
 
 // ============================================================
 // Binary Reader
@@ -78,12 +80,25 @@ async function parseProp(reader) {
             const clen  = reader.getUint32();
             let raw = reader.getArrayBuffer(clen);
             if (enc === 1) raw = await zlibDecompress(raw);
+            if (type === 'l') return decodeInt64Array(raw, count);
             const Ctor = { f: Float32Array, d: Float64Array, i: Int32Array,
-                           l: Float64Array, b: Uint8Array,   c: Uint8Array }[type];
+                           b: Uint8Array,   c: Uint8Array }[type];
             return Array.from(new Ctor(raw));
         }
         default: throw new Error(`Unknown FBX property type: ${type}`);
     }
+}
+
+function decodeInt64Array(raw, count) {
+    const dv = new DataView(raw);
+    const values = [];
+    for (let i = 0; i < count; i++) {
+        const off = i * 8;
+        const lo = dv.getUint32(off, true);
+        const hi = dv.getInt32(off + 4, true);
+        values.push(hi * 4294967296 + lo);
+    }
+    return values;
 }
 
 // ============================================================
@@ -390,18 +405,67 @@ function applyGeometryTransformToNormal(x, y, z, transform) {
     return [r[0] / len, r[1] / len, r[2] / len];
 }
 
-function makeBabylonLocalMatrix(modelNode) {
-    const { T, R, S, preR, rotOrder } = getModelTransform(modelNode);
+function makeBabylonLocalMatrixFromTransform({ T, R, S, preR, rotOrder }) {
     const position = new BABYLON.Vector3(T[0], T[1], -T[2]);
     const rotation = fbxEulerToQuat(preR, 0).multiply(fbxEulerToQuat(R, rotOrder));
     const scaling = new BABYLON.Vector3(S[0], S[1], S[2]);
     return BABYLON.Matrix.Compose(scaling, rotation, position);
 }
 
+function makeBabylonLocalMatrix(modelNode) {
+    return makeBabylonLocalMatrixFromTransform(getModelTransform(modelNode));
+}
+
+function getAnimationAxis(prop) {
+    if (!prop) return -1;
+    if (prop.endsWith('X')) return 0;
+    if (prop.endsWith('Y')) return 1;
+    if (prop.endsWith('Z')) return 2;
+    return -1;
+}
+
+function getCurveData(curveNode) {
+    const keyTimes = prop0(findNode(curveNode.children, 'KeyTime')) ?? [];
+    const keyValues = prop0(findNode(curveNode.children, 'KeyValueFloat')) ?? [];
+    return {
+        times: keyTimes.map(t => t * FBX_TIME_UNIT_SECONDS),
+        values: keyValues,
+    };
+}
+
+function sampleCurve(curve, time, fallback) {
+    if (!curve || !curve.times.length || !curve.values.length) return fallback;
+    const times = curve.times;
+    const values = curve.values;
+    if (time <= times[0]) return values[0];
+    const last = times.length - 1;
+    if (time >= times[last]) return values[last];
+
+    let lo = 0;
+    let hi = last;
+    while (lo + 1 < hi) {
+        const mid = (lo + hi) >> 1;
+        if (times[mid] <= time) lo = mid;
+        else hi = mid;
+    }
+
+    const span = times[hi] - times[lo] || 1;
+    const t = (time - times[lo]) / span;
+    return values[lo] + (values[hi] - values[lo]) * t;
+}
+
+function sampleCurveNode(channel, time, fallback) {
+    return [
+        sampleCurve(channel?.curves[0], time, channel?.defaults[0] ?? fallback[0]),
+        sampleCurve(channel?.curves[1], time, channel?.defaults[1] ?? fallback[1]),
+        sampleCurve(channel?.curves[2], time, channel?.defaults[2] ?? fallback[2]),
+    ];
+}
+
 // ============================================================
 // Main: load FBX URL and build Babylon.js meshes
 // ============================================================
-async function loadFBX(url, scene) {
+async function loadFBX(url, scene, options = {}) {
     console.log(`[FBX] Fetching: ${url}`);
     const response = await fetch(url);
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${url}`);
@@ -430,6 +494,10 @@ async function loadFBX(url, scene) {
     const matById      = new Map();
     const skinById     = new Map();
     const clusterById  = new Map();
+    const animStackById = new Map();
+    const animLayerById = new Map();
+    const animCurveNodeById = new Map();
+    const animCurveById = new Map();
     const texById   = new Map(); // id → { relativeFilename }
     for (const obj of objectsNode.children) {
         const id = obj.props[0];
@@ -441,6 +509,10 @@ async function loadFBX(url, scene) {
         if (obj.name === 'Material') matById.set(id, obj);
         if (obj.name === 'Deformer' && obj.props[2] === 'Skin') skinById.set(id, obj);
         if (obj.name === 'Deformer' && obj.props[2] === 'Cluster') clusterById.set(id, obj);
+        if (obj.name === 'AnimationStack') animStackById.set(id, obj);
+        if (obj.name === 'AnimationLayer') animLayerById.set(id, obj);
+        if (obj.name === 'AnimationCurveNode') animCurveNodeById.set(id, obj);
+        if (obj.name === 'AnimationCurve') animCurveById.set(id, obj);
         if (obj.name === 'Texture') {
             const relFn = prop0(findNode(obj.children, 'RelativeFilename'));
             if (relFn) texById.set(id, { relativeFilename: relFn.replace(/\\/g, '/') });
@@ -455,6 +527,10 @@ async function loadFBX(url, scene) {
     const geoToSkin    = new Map(); // geoId   → skinId
     const skinToClusters = new Map(); // skinId → clusterId[]
     const clusterToBoneModel = new Map(); // clusterId → modelId
+    const animLayerToStack = new Map(); // layerId → stackId
+    const animCurveNodeToLayer = new Map(); // curveNodeId → layerId
+    const animCurveNodeToTarget = new Map(); // curveNodeId → { modelId, property }
+    const animCurvesByNode = new Map(); // curveNodeId → AnimationCurve[3]
     for (const c of connList) {
         if (geoById.has(c.from) && modelById.has(c.to)) geoToModel.set(c.from, c.to);
         if (matById.has(c.from) && modelById.has(c.to) && !modelToMat.has(c.to)) modelToMat.set(c.to, c.from);
@@ -465,12 +541,24 @@ async function loadFBX(url, scene) {
             skinToClusters.get(c.to).push(c.from);
         }
         if (allModelById.has(c.from) && clusterById.has(c.to)) clusterToBoneModel.set(c.to, c.from);
+        if (animLayerById.has(c.from) && animStackById.has(c.to)) animLayerToStack.set(c.from, c.to);
+        if (animCurveNodeById.has(c.from) && animLayerById.has(c.to)) animCurveNodeToLayer.set(c.from, c.to);
+        if (animCurveNodeById.has(c.from) && allModelById.has(c.to)) {
+            animCurveNodeToTarget.set(c.from, { modelId: c.to, property: c.prop });
+        }
+        if (animCurveById.has(c.from) && animCurveNodeById.has(c.to)) {
+            const axis = getAnimationAxis(c.prop);
+            if (axis >= 0) {
+                if (!animCurvesByNode.has(c.to)) animCurvesByNode.set(c.to, [null, null, null]);
+                animCurvesByNode.get(c.to)[axis] = animCurveById.get(c.from);
+            }
+        }
         if (c.type === 'OO' && allModelById.has(c.from) && !nodeToParent.has(c.from)) {
             nodeToParent.set(c.from, c.to);
         }
     }
 
-    console.log(`[FBX] Geometries: ${geoById.size}, Models: ${modelById.size}, Materials: ${matById.size}, Textures: ${texById.size}, Skins: ${skinById.size}`);
+    console.log(`[FBX] Geometries: ${geoById.size}, Models: ${modelById.size}, Materials: ${matById.size}, Textures: ${texById.size}, Skins: ${skinById.size}, AnimationStacks: ${animStackById.size}`);
 
     function applyFbxTransform(bjsNode, fbxModelNode) {
         const { T, R, S, preR, rotOrder, geoT, geoR, geoS } = getModelTransform(fbxModelNode);
@@ -533,7 +621,7 @@ async function loadFBX(url, scene) {
             boneIndexByModelId.set(boneModelId, skeleton.bones.length - 1);
         }
 
-        return { skeleton, boneIndexByModelId, clusterByBoneModelId };
+        return { skeleton, boneByModelId, boneIndexByModelId, clusterByBoneModelId };
     }
 
     function buildSkinWeightsByVertex(geoNode, skinInfo) {
@@ -559,6 +647,125 @@ async function loadFBX(url, scene) {
         }
 
         return weightsByVertex;
+    }
+
+    function getPrimaryAnimationLayerId() {
+        let bestLayerId = null;
+        let bestCount = 0;
+        const counts = new Map();
+        for (const layerId of animCurveNodeToLayer.values()) {
+            counts.set(layerId, (counts.get(layerId) ?? 0) + 1);
+        }
+        for (const [layerId, count] of counts) {
+            if (count > bestCount) {
+                bestLayerId = layerId;
+                bestCount = count;
+            }
+        }
+        return bestLayerId;
+    }
+
+    function makeAnimationChannel(curveNodeId) {
+        const curveNode = animCurveNodeById.get(curveNodeId);
+        const props = parseProps70(findNode(curveNode.children, 'Properties70'));
+        const curveNodes = animCurvesByNode.get(curveNodeId) ?? [null, null, null];
+        const curves = curveNodes.map(curveNode => curveNode ? getCurveData(curveNode) : null);
+        return {
+            defaults: [
+                props.get('d|X') ?? 0,
+                props.get('d|Y') ?? 0,
+                props.get('d|Z') ?? 0,
+            ],
+            curves,
+        };
+    }
+
+    function createSkeletonAnimationRuntime(skinInfo) {
+        const layerId = getPrimaryAnimationLayerId();
+        if (!layerId || !skinInfo?.boneByModelId?.size) return null;
+
+        const channelsByBoneModelId = new Map();
+        let start = Infinity;
+        let stop = -Infinity;
+
+        for (const [curveNodeId, target] of animCurveNodeToTarget) {
+            if (animCurveNodeToLayer.get(curveNodeId) !== layerId) continue;
+            if (!skinInfo.boneByModelId.has(target.modelId)) continue;
+
+            const key = target.property === 'Lcl Translation'
+                ? 'T'
+                : target.property === 'Lcl Rotation'
+                    ? 'R'
+                    : target.property === 'Lcl Scaling'
+                        ? 'S'
+                        : null;
+            if (!key) continue;
+
+            const channel = makeAnimationChannel(curveNodeId);
+            for (const curve of channel.curves) {
+                if (!curve?.times.length) continue;
+                start = Math.min(start, curve.times[0]);
+                stop = Math.max(stop, curve.times[curve.times.length - 1]);
+            }
+
+            if (!channelsByBoneModelId.has(target.modelId)) channelsByBoneModelId.set(target.modelId, {});
+            channelsByBoneModelId.get(target.modelId)[key] = channel;
+        }
+
+        if (!channelsByBoneModelId.size || stop <= start) return null;
+
+        const stackId = animLayerToStack.get(layerId);
+        const stackName = animStackById.get(stackId)?.props[1]?.split('\0')[0] ?? 'animation';
+        return {
+            name: stackName,
+            start,
+            stop,
+            duration: stop - start,
+            channelsByBoneModelId,
+            elapsed: 0,
+        };
+    }
+
+    function applySkeletonAnimation(skinInfo, runtime, time) {
+        for (const [boneModelId, channels] of runtime.channelsByBoneModelId) {
+            const bone = skinInfo.boneByModelId.get(boneModelId);
+            const modelNode = allModelById.get(boneModelId);
+            if (!bone || !modelNode) continue;
+
+            const base = getModelTransform(modelNode);
+            const T = sampleCurveNode(channels.T, time, base.T);
+            const R = sampleCurveNode(channels.R, time, base.R);
+            const S = sampleCurveNode(channels.S, time, base.S);
+            const matrix = makeBabylonLocalMatrixFromTransform({
+                T,
+                R,
+                S,
+                preR: base.preR,
+                rotOrder: base.rotOrder,
+            });
+
+            if (typeof bone.updateMatrix === 'function') {
+                bone.updateMatrix(matrix, false, true);
+            }
+        }
+        if (typeof skinInfo.skeleton.prepare === 'function') skinInfo.skeleton.prepare();
+    }
+
+    function startSkeletonAnimation(skinInfo, runtime) {
+        if (Number.isFinite(options.animationTime)) {
+            const fixedTime = runtime.start + (((options.animationTime % runtime.duration) + runtime.duration) % runtime.duration);
+            applySkeletonAnimation(skinInfo, runtime, fixedTime);
+            return null;
+        }
+
+        applySkeletonAnimation(skinInfo, runtime, runtime.start);
+        const observer = scene.onBeforeRenderObservable.add(() => {
+            const engine = scene.getEngine?.();
+            const delta = engine ? engine.getDeltaTime() / 1000 : 1 / 60;
+            runtime.elapsed = (runtime.elapsed + delta) % runtime.duration;
+            applySkeletonAnimation(skinInfo, runtime, runtime.start + runtime.elapsed);
+        });
+        return observer;
     }
 
     const bjsNodeById     = new Map();
@@ -666,6 +873,22 @@ async function loadFBX(url, scene) {
         if (!bjsNode.parent) bjsNode.parent = modelRoot;
     }
     allCreatedNodes.push(modelRoot);
+
+    const animationObservers = [];
+    if (options.animation !== false) {
+        for (const skinInfo of skinInfoBySkinId.values()) {
+            const runtime = createSkeletonAnimationRuntime(skinInfo);
+            if (!runtime) continue;
+            const observer = startSkeletonAnimation(skinInfo, runtime);
+            if (observer) animationObservers.push(observer);
+            console.log(`[FBX] Animation: ${runtime.name} duration=${runtime.duration.toFixed(3)}s bones=${runtime.channelsByBoneModelId.size}`);
+        }
+    }
+    if (animationObservers.length && modelRoot.onDisposeObservable) {
+        modelRoot.onDisposeObservable.add(() => {
+            for (const observer of animationObservers) scene.onBeforeRenderObservable.remove(observer);
+        });
+    }
 
     console.log(`[FBX] Done — created ${allCreatedNodes.length} node(s) (${createdMeshes.length} mesh(es))`);
 
