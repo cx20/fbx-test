@@ -22,6 +22,8 @@ const SCALES = new Map([
 ]);
 
 const FBX_BASE = '../../assets/models/fbx/';
+const CUSTOM_URL_OPTION = '__custom_url__';
+const SEARCH_PARAMS = new URLSearchParams(window.location.search);
 
 let engine, scene, canvas, camera;
 let importedMeshes = [];
@@ -32,8 +34,44 @@ function setStatus(msg) {
 }
 
 function getInitialModel() {
-    const model = new URLSearchParams(window.location.search).get('model');
+    const model = SEARCH_PARAMS.get('model');
     return ASSETS.includes(model) ? model : 'vCube';
+}
+
+function getCustomUrl() {
+    const url = SEARCH_PARAMS.get('url');
+    return url && url.trim() ? url.trim() : null;
+}
+
+function getInitialSelection() {
+    return getCustomUrl() ? CUSTOM_URL_OPTION : getInitialModel();
+}
+
+function getUrlFileName(url) {
+    try {
+        const parsed = new URL(url, window.location.href);
+        const name = parsed.pathname.split('/').pop() || url;
+        return decodeURIComponent(name);
+    } catch {
+        const name = url.split(/[\\/]/).pop() || url;
+        return decodeURIComponent(name);
+    }
+}
+
+function getScaleOverride() {
+    const scale = Number(SEARCH_PARAMS.get('scale'));
+    return Number.isFinite(scale) && scale > 0 ? scale : null;
+}
+
+function getAnimationEnabled() {
+    const value = SEARCH_PARAMS.get('animation') ?? SEARCH_PARAMS.get('anim');
+    return !['0', 'false', 'off', 'no'].includes((value ?? '').toLowerCase());
+}
+
+function getAnimationTime() {
+    const value = SEARCH_PARAMS.get('time');
+    const time = value === null ? NaN : Number(value);
+    return Number.isFinite(time) ? time : null;
 }
 
 function frameModel(nodes) {
@@ -61,23 +99,27 @@ function frameModel(nodes) {
     camera.radius = Math.max(size * 1.25, 1);
 }
 
-async function loadModel(name) {
+async function loadModel(selection) {
     if (isLoading) return;
     isLoading = true;
+    const customUrl = selection === CUSTOM_URL_OPTION ? getCustomUrl() : null;
+    const name = customUrl ? getUrlFileName(customUrl).replace(/\.fbx$/i, '') : selection;
     setStatus(`読み込み中: ${name} ...`);
 
     try {
         importedMeshes.forEach(m => m.dispose());
         importedMeshes = [];
 
-        const fbxPath = name.split('/').map(encodeURIComponent).join('/');
-        const url     = FBX_BASE + fbxPath + '.fbx';
+        const url = customUrl ?? (FBX_BASE + selection.split('/').map(encodeURIComponent).join('/') + '.fbx');
 
-        const meshes = await FBXLoader.loadFBX(url, scene);
+        const meshes = await FBXLoader.loadFBX(url, scene, {
+            animation: getAnimationEnabled(),
+            animationTime: getAnimationTime(),
+        });
 
-        const scale = SCALES.get(name) ?? 1;
+        const scale = getScaleOverride() ?? SCALES.get(selection) ?? 1;
         if (scale !== 1) {
-            // Only scale root nodes; children inherit scale through the hierarchy
+            // Only scale root nodes; children inherit scale through the hierarchy.
             meshes.filter(m => !meshes.includes(m.parent)).forEach(m => m.scaling.scaleInPlace(scale));
         }
 
@@ -119,13 +161,21 @@ async function init() {
 
     // プルダウン初期化
     const select = document.getElementById('modelSelect');
-    const initialModel = getInitialModel();
+    const customUrl = getCustomUrl();
+    const initialSelection = getInitialSelection();
+    if (customUrl) {
+        const opt = document.createElement('option');
+        opt.value = CUSTOM_URL_OPTION;
+        opt.textContent = `Custom: ${getUrlFileName(customUrl)}`;
+        opt.selected = true;
+        select.appendChild(opt);
+    }
     ASSETS.forEach(name => {
         const opt = document.createElement('option');
         opt.value = name;
         opt.textContent = name;
         // vCube を初期選択
-        if (name === initialModel) opt.selected = true;
+        if (name === initialSelection) opt.selected = true;
         select.appendChild(opt);
     });
     select.addEventListener('change', () => loadModel(select.value));
@@ -134,7 +184,7 @@ async function init() {
     window.addEventListener('resize', () => engine.resize());
 
     // 初期モデルを読み込む
-    await loadModel(initialModel);
+    await loadModel(initialSelection);
 }
 
 init();

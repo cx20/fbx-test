@@ -31,6 +31,7 @@ let renderer, scene, camera, controls, loader;
 let importedObject = null;
 let mixer = null;
 let isLoading = false;
+const fixedAnimationTime = getAnimationTime();
 const timer = new THREE.Timer();
 timer.connect(document);
 
@@ -47,6 +48,12 @@ function getAnimationEnabled() {
     const params = new URLSearchParams(window.location.search);
     const value = params.get('animation') ?? params.get('anim');
     return !['0', 'false', 'off', 'no'].includes((value ?? '').toLowerCase());
+}
+
+function getAnimationTime() {
+    const value = new URLSearchParams(window.location.search).get('time');
+    const time = value === null ? NaN : Number(value);
+    return Number.isFinite(time) ? time : null;
 }
 
 function disposeObject(object) {
@@ -111,6 +118,7 @@ async function loadModel(name) {
         if (clip) {
             mixer = new THREE.AnimationMixer(object);
             mixer.clipAction(clip).play();
+            if (fixedAnimationTime !== null) mixer.setTime(fixedAnimationTime);
         }
 
         scene.add(object);
@@ -202,7 +210,7 @@ function onResize() {
 function animate() {
     timer.update();
     const delta = timer.getDelta();
-    if (mixer) mixer.update(delta);
+    if (mixer && fixedAnimationTime === null) mixer.update(delta);
     controls.update();
     renderer.render(scene, camera);
 }
