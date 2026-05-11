@@ -28,7 +28,7 @@ const SEARCH_PARAMS = new URLSearchParams(window.location.search);
 let engine, scene, canvas, camera;
 let importedMeshes = [];
 let gui, animationFolder, timeController;
-let activeAnimation = null;
+let activeAnimations = [];
 let isLoading = false;
 
 function setStatus(msg) {
@@ -89,9 +89,7 @@ function getAnimationTime() {
 const PARAMS = {
     asset: getInitialSelection(),
     animate: getAnimationEnabled(),
-    fixedTime: getAnimationTime() !== null,
     time: getAnimationTime() ?? 0,
-    model: true,
     debug: showDebugLayer,
 };
 
@@ -130,7 +128,7 @@ async function loadModel(selection) {
     try {
         importedMeshes.forEach(m => m.dispose());
         importedMeshes = [];
-        activeAnimation = null;
+        activeAnimations = [];
         rebuildAnimationFolder();
 
         const url = customUrl ?? (FBX_BASE + selection.split('/').map(encodeURIComponent).join('/') + '.fbx');
@@ -150,7 +148,6 @@ async function loadModel(selection) {
         PARAMS.asset = selection;
         frameModel(meshes);
         rebuildAnimationFolder();
-        setObjectVisibility();
 
         const meshCount = meshes.filter(m => m instanceof BABYLON.Mesh).length;
         const msg = `${name} — meshes: ${meshCount}`;
@@ -178,34 +175,23 @@ function rebuildAnimationFolder() {
     [...animationFolder.children].forEach(child => child.destroy());
     animationFolder.hide();
 
-    const animations = getAnimationControls();
-    activeAnimation = animations[0] ?? null;
-    if (!activeAnimation) return;
+    activeAnimations = getAnimationControls();
+    if (!activeAnimations.length) return;
 
-    PARAMS.animate = activeAnimation.playing;
-    PARAMS.fixedTime = activeAnimation.fixedTime;
-    PARAMS.time = getAnimationTime() ?? activeAnimation.time;
+    PARAMS.animate = activeAnimations.some(animation => animation.playing);
+    PARAMS.time = getAnimationTime() ?? activeAnimations[0].time;
     animationFolder.show();
     animationFolder.add(PARAMS, 'animate').name('play').onChange(value => {
-        activeAnimation?.setPlaying(value);
+        activeAnimations.forEach(animation => animation.setPlaying(value));
     });
-    animationFolder.add(PARAMS, 'fixedTime').name('fixed time').onChange(value => {
-        activeAnimation?.setFixedTime(value);
-    });
-    timeController = animationFolder.add(PARAMS, 'time', 0, activeAnimation.duration, 0.01)
+    const duration = Math.max(...activeAnimations.map(animation => animation.duration));
+    timeController = animationFolder.add(PARAMS, 'time', 0, duration, 0.01)
         .name('time')
         .onChange(value => {
-            activeAnimation?.setTime(value);
+            activeAnimations.forEach(animation => animation.setTime(value));
         });
-    activeAnimation.setTime(PARAMS.time);
+    activeAnimations.forEach(animation => animation.setTime(PARAMS.time));
     timeController.updateDisplay();
-}
-
-function setObjectVisibility() {
-    importedMeshes.forEach(node => {
-        if (node.parent && importedMeshes.includes(node.parent)) return;
-        node.setEnabled(PARAMS.model);
-    });
 }
 
 function showDebugLayer() {
@@ -225,7 +211,6 @@ function showDebugLayer() {
 function initGui() {
     gui = new lil.GUI();
     gui.add(PARAMS, 'asset', getAssetOptions()).name('asset').onChange(loadModel);
-    gui.add(PARAMS, 'model').name('model').onChange(setObjectVisibility);
     animationFolder = gui.addFolder('Animation').hide();
     gui.add(PARAMS, 'debug').name('Debug');
 }

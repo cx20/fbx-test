@@ -68,10 +68,8 @@ function getScaleOverride() {
 const PARAMS = {
     asset: getInitialModel(),
     animate: getAnimationEnabled(),
-    fixedTime: getAnimationTime() !== null,
     time: getAnimationTime() ?? 0,
     clip: '',
-    model: true,
     skeleton: false,
     ground: true,
     grid: true,
@@ -132,13 +130,12 @@ function setActiveClip(clipName = PARAMS.clip) {
 }
 
 function applyAnimationTime() {
-    if (mixer && PARAMS.fixedTime) {
+    if (mixer && !PARAMS.animate) {
         mixer.setTime(PARAMS.time);
     }
 }
 
 function setObjectVisibility() {
-    if (importedObject) importedObject.visible = PARAMS.model;
     if (skeletonHelper) skeletonHelper.visible = PARAMS.skeleton;
     if (ground) ground.visible = PARAMS.ground;
     if (grid) grid.visible = PARAMS.grid;
@@ -159,7 +156,6 @@ function rebuildAnimationFolder(object) {
     animationFolder.add(PARAMS, 'animate').name('play').onChange(value => {
         if (!value) applyAnimationTime();
     });
-    animationFolder.add(PARAMS, 'fixedTime').name('fixed time').onChange(applyAnimationTime);
     timeController = animationFolder.add(PARAMS, 'time', 0, Math.max(...object.animations.map(clip => clip.duration)), 0.01)
         .name('time')
         .onChange(applyAnimationTime);
@@ -218,6 +214,7 @@ async function loadModel(name) {
             mixer = new THREE.AnimationMixer(object);
             rebuildAnimationFolder(object);
             setActiveClip(PARAMS.clip);
+            if (getAnimationTime() !== null) mixer.setTime(PARAMS.time);
         } else {
             rebuildAnimationFolder(object);
         }
@@ -227,7 +224,6 @@ async function loadModel(name) {
         skeletonHelper.visible = PARAMS.skeleton;
         scene.add(skeletonHelper);
         rebuildMorphsFolder(object);
-        setObjectVisibility();
 
         const meshCount = countMeshes(object);
         const msg = `${name} — meshes: ${meshCount}`;
@@ -245,7 +241,6 @@ async function loadModel(name) {
 function initGui() {
     gui = new GUI();
     gui.add(PARAMS, 'asset', ASSETS).name('asset').onChange(loadModel);
-    gui.add(PARAMS, 'model').name('model').onChange(setObjectVisibility);
     gui.add(PARAMS, 'skeleton').name('skeleton').onChange(setObjectVisibility);
     gui.add(PARAMS, 'ground').name('ground').onChange(setObjectVisibility);
     gui.add(PARAMS, 'grid').name('grid').onChange(setObjectVisibility);
@@ -316,7 +311,7 @@ function onResize() {
 function animate() {
     timer.update();
     const delta = timer.getDelta();
-    if (mixer && PARAMS.animate && !PARAMS.fixedTime) mixer.update(delta);
+    if (mixer && PARAMS.animate) mixer.update(delta);
     controls.update();
     renderer.render(scene, camera);
 }

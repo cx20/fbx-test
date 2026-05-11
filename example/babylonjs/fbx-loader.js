@@ -570,20 +570,12 @@ async function loadFBX(url, scene, options = {}) {
         return { T, R, S, preR, rotOrder, geoT, geoR, geoS };
     }
 
-    function createSkeletonForSkin(skinId, nameHint) {
-        const clusterIds = skinToClusters.get(skinId) ?? [];
-        const boneModelIds = [];
-        const clusterByBoneModelId = new Map();
+    function getModelDisplayName(modelNode, fallback) {
+        const rawName = modelNode?.props[1] ?? '';
+        return rawName.split('\0')[0].replace(/Model$/, '') || fallback;
+    }
 
-        for (const clusterId of clusterIds) {
-            const boneModelId = clusterToBoneModel.get(clusterId);
-            if (boneModelId === undefined || !allModelById.has(boneModelId)) continue;
-            if (!clusterByBoneModelId.has(boneModelId)) boneModelIds.push(boneModelId);
-            clusterByBoneModelId.set(boneModelId, clusterId);
-        }
-
-        if (!boneModelIds.length) return null;
-
+    function orderBoneModelIds(boneModelIds) {
         const boneModelSet = new Set(boneModelIds);
         const childrenByBoneId = new Map();
         const rootBoneIds = [];
@@ -607,21 +599,66 @@ async function loadFBX(url, scene, options = {}) {
         }
         for (const rootBoneId of rootBoneIds) visit(rootBoneId);
         for (const boneModelId of boneModelIds) visit(boneModelId);
+        return { orderedBoneIds, rootBoneIds, boneModelSet };
+    }
 
-        const skeleton = new BABYLON.Skeleton(`${nameHint}_skeleton`, `${nameHint}_skeleton`, scene);
-        const boneByModelId = new Map();
-        const boneIndexByModelId = new Map();
-        for (const boneModelId of orderedBoneIds) {
-            const boneModelNode = allModelById.get(boneModelId);
-            const rawName = boneModelNode.props[1] ?? '';
-            const boneName = rawName.split('\0')[0].replace(/Model$/, '') || `bone_${boneModelId}`;
-            const parentBone = boneByModelId.get(nodeToParent.get(boneModelId)) ?? null;
-            const bone = new BABYLON.Bone(boneName, skeleton, parentBone, makeBabylonLocalMatrix(boneModelNode));
-            boneByModelId.set(boneModelId, bone);
-            boneIndexByModelId.set(boneModelId, skeleton.bones.length - 1);
+    function getSkeletonName(orderedBoneIds, rootBoneIds, nameHint) {
+        const rootParentIds = [...new Set(rootBoneIds.map(id => nodeToParent.get(id)).filter(id => id && id !== 0))];
+        if (rootParentIds.length === 1 && allModelById.has(rootParentIds[0])) {
+            return getModelDisplayName(allModelById.get(rootParentIds[0]), nameHint);
         }
 
-        return { skeleton, boneByModelId, boneIndexByModelId, clusterByBoneModelId };
+        const firstBoneName = getModelDisplayName(allModelById.get(orderedBoneIds[0]), '');
+        if (firstBoneName.startsWith('mixamorig:')) return 'Armature';
+        return `${nameHint}_skeleton`;
+    }
+
+    const sharedSkeletonByBoneKey = new Map();
+
+    function createSkeletonForSkin(skinId, nameHint) {
+        const clusterIds = skinToClusters.get(skinId) ?? [];
+        const boneModelIds = [];
+        const clusterByBoneModelId = new Map();
+
+        for (const clusterId of clusterIds) {
+            const boneModelId = clusterToBoneModel.get(clusterId);
+            if (boneModelId === undefined || !allModelById.has(boneModelId)) continue;
+            if (!clusterByBoneModelId.has(boneModelId)) boneModelIds.push(boneModelId);
+            clusterByBoneModelId.set(boneModelId, clusterId);
+        }
+
+        if (!boneModelIds.length) return null;
+
+        const { orderedBoneIds, rootBoneIds, boneModelSet } = orderBoneModelIds(boneModelIds);
+        const boneKey = orderedBoneIds.join('|');
+        let shared = sharedSkeletonByBoneKey.get(boneKey);
+        if (!shared) {
+            const skeletonName = getSkeletonName(orderedBoneIds, rootBoneIds, nameHint);
+            const skeleton = new BABYLON.Skeleton(skeletonName, skeletonName, scene);
+            const boneByModelId = new Map();
+            const boneIndexByModelId = new Map();
+            const nodeByModelId = new Map();
+            for (const boneModelId of orderedBoneIds) {
+                const boneModelNode = allModelById.get(boneModelId);
+                const boneName = getModelDisplayName(boneModelNode, `bone_${boneModelId}`);
+                const parentBone = boneByModelId.get(nodeToParent.get(boneModelId)) ?? null;
+                const bone = new BABYLON.Bone(boneName, skeleton, parentBone, makeBabylonLocalMatrix(boneModelNode));
+                boneByModelId.set(boneModelId, bone);
+                boneIndexByModelId.set(boneModelId, skeleton.bones.length - 1);
+            }
+            shared = {
+                skeleton,
+                boneByModelId,
+                boneIndexByModelId,
+                nodeByModelId,
+                orderedBoneIds,
+                rootBoneIds,
+                boneModelSet,
+            };
+            sharedSkeletonByBoneKey.set(boneKey, shared);
+        }
+
+        return { ...shared, clusterByBoneModelId };
     }
 
     function buildSkinWeightsByVertex(geoNode, skinInfo) {
@@ -747,6 +784,16 @@ async function loadFBX(url, scene, options = {}) {
             if (typeof bone.updateMatrix === 'function') {
                 bone.updateMatrix(matrix, false, true);
             }
+            const boneNode = skinInfo.nodeByModelId?.get(boneModelId);
+            if (boneNode) {
+                const scaling = new BABYLON.Vector3();
+                const rotation = new BABYLON.Quaternion();
+                const position = new BABYLON.Vector3();
+                matrix.decompose(scaling, rotation, position);
+                boneNode.position.copyFrom(position);
+                boneNode.rotationQuaternion = rotation;
+                boneNode.scaling.copyFrom(scaling);
+            }
         }
         if (typeof skinInfo.skeleton.prepare === 'function') skinInfo.skeleton.prepare();
     }
@@ -757,7 +804,6 @@ async function loadFBX(url, scene, options = {}) {
             duration: runtime.duration,
             time: 0,
             playing: options.animation !== false,
-            fixedTime: Number.isFinite(options.animationTime),
             observer: null,
             setTime(time) {
                 this.time = ((time % runtime.duration) + runtime.duration) % runtime.duration;
@@ -767,10 +813,6 @@ async function loadFBX(url, scene, options = {}) {
             setPlaying(playing) {
                 this.playing = playing;
             },
-            setFixedTime(fixedTime) {
-                this.fixedTime = fixedTime;
-                if (fixedTime) this.setTime(this.time);
-            },
             dispose() {
                 if (this.observer) scene.onBeforeRenderObservable.remove(this.observer);
                 this.observer = null;
@@ -779,7 +821,7 @@ async function loadFBX(url, scene, options = {}) {
 
         control.setTime(Number.isFinite(options.animationTime) ? options.animationTime : 0);
         control.observer = scene.onBeforeRenderObservable.add(() => {
-            if (!control.playing || control.fixedTime) return;
+            if (!control.playing) return;
             const engine = scene.getEngine?.();
             const delta = engine ? engine.getDeltaTime() / 1000 : 1 / 60;
             control.setTime(control.time + delta);
@@ -787,10 +829,64 @@ async function loadFBX(url, scene, options = {}) {
         return control;
     }
 
+    function uniqueSkinInfos(skinInfos) {
+        const seen = new Set();
+        const unique = [];
+        for (const skinInfo of skinInfos) {
+            if (!skinInfo?.skeleton || seen.has(skinInfo.skeleton)) continue;
+            seen.add(skinInfo.skeleton);
+            unique.push(skinInfo);
+        }
+        return unique;
+    }
+
     const bjsNodeById     = new Map();
     const allCreatedNodes = [];
     const createdMeshes   = [];
     const skinInfoBySkinId = new Map();
+    const syntheticRootNodes = [];
+
+    function createSyntheticArmatureNode(skinInfo) {
+        const armature = new BABYLON.TransformNode(skinInfo.skeleton.name || 'Armature', scene);
+        allCreatedNodes.push(armature);
+        syntheticRootNodes.push(armature);
+        return armature;
+    }
+
+    function createTransformNodeForModel(modelId) {
+        if (bjsNodeById.has(modelId)) return bjsNodeById.get(modelId);
+        const modelNode = allModelById.get(modelId);
+        if (!modelNode) return null;
+
+        const nodeName = getModelDisplayName(modelNode, `node_${modelId}`);
+        const tn = new BABYLON.TransformNode(nodeName, scene);
+        const { T, R, preR, rotOrder } = applyFbxTransform(tn, modelNode);
+        console.log(`[FBX] TransformNode: ${nodeName} T=${JSON.stringify(T)} R=${JSON.stringify(R)} preR=${JSON.stringify(preR)} rotOrder=${rotOrder}`);
+        bjsNodeById.set(modelId, tn);
+        allCreatedNodes.push(tn);
+        return tn;
+    }
+
+    function createSkeletonTransformNodes(skinInfos) {
+        for (const skinInfo of uniqueSkinInfos(skinInfos)) {
+            const rootParentIds = [...new Set(skinInfo.rootBoneIds.map(id => nodeToParent.get(id)).filter(id => id && id !== 0))];
+            const armatureNode = rootParentIds.length === 1 && allModelById.has(rootParentIds[0])
+                ? createTransformNodeForModel(rootParentIds[0])
+                : createSyntheticArmatureNode(skinInfo);
+
+            for (const boneModelId of skinInfo.orderedBoneIds) {
+                const boneNode = createTransformNodeForModel(boneModelId);
+                if (!boneNode) continue;
+                skinInfo.nodeByModelId.set(boneModelId, boneNode);
+
+                const parentId = nodeToParent.get(boneModelId);
+                if ((!parentId || parentId === 0 || !skinInfo.boneModelSet.has(parentId)) && armatureNode) {
+                    boneNode.parent = armatureNode;
+                }
+            }
+        }
+    }
+
     for (const [geoId, geoNode] of geoById) {
         const modelId   = geoToModel.get(geoId);
         const modelNode = modelId !== undefined ? modelById.get(modelId) : null;
@@ -861,19 +957,14 @@ async function loadFBX(url, scene, options = {}) {
         let parentId = nodeToParent.get(meshModelId);
         while (parentId && parentId !== 0 && !seenIds.has(parentId)) {
             seenIds.add(parentId);
-            const parentFbxNode = allModelById.get(parentId);
-            if (parentFbxNode) {
-                const rawName  = parentFbxNode.props[1] ?? '';
-                const nodeName = rawName.split('\0')[0].replace(/Model$/, '') || `node_${parentId}`;
-                const tn = new BABYLON.TransformNode(nodeName, scene);
-                const { T, R, preR, rotOrder } = applyFbxTransform(tn, parentFbxNode);
-                console.log(`[FBX] TransformNode: ${nodeName} T=${JSON.stringify(T)} R=${JSON.stringify(R)} preR=${JSON.stringify(preR)} rotOrder=${rotOrder}`);
-                bjsNodeById.set(parentId, tn);
-                allCreatedNodes.push(tn);
-            }
+            createTransformNodeForModel(parentId);
             parentId = nodeToParent.get(parentId);
         }
     }
+
+    // Pass 2.5: create TransformNodes for skeleton bones so the scene hierarchy
+    // resembles Babylon.js glTF imports, which expose armature nodes separately.
+    createSkeletonTransformNodes([...skinInfoBySkinId.values()]);
 
     // Pass 3: wire parent-child relationships
     for (const [nodeId, bjsNode] of bjsNodeById) {
@@ -887,14 +978,15 @@ async function loadFBX(url, scene, options = {}) {
     // Pass 4: wrap all FBX-root-level nodes in a single modelRoot.
     // This ensures scaleInPlace() in the caller scales positions uniformly
     // (Bip001.position=[0, 0.937, 0] must be multiplied by scale, not left as-is).
-    const modelRoot = new BABYLON.TransformNode('__model_root__', scene);
-    for (const bjsNode of bjsNodeById.values()) {
+    const modelRoot = new BABYLON.TransformNode('__root__', scene);
+    for (const bjsNode of [...bjsNodeById.values(), ...syntheticRootNodes]) {
         if (!bjsNode.parent) bjsNode.parent = modelRoot;
     }
     allCreatedNodes.push(modelRoot);
 
+    const loadedSkinInfos = uniqueSkinInfos([...skinInfoBySkinId.values()]);
     const animationControls = [];
-    for (const skinInfo of skinInfoBySkinId.values()) {
+    for (const skinInfo of loadedSkinInfos) {
         const runtime = createSkeletonAnimationRuntime(skinInfo);
         if (!runtime) continue;
         const control = createSkeletonAnimationControl(skinInfo, runtime);
@@ -904,10 +996,12 @@ async function loadFBX(url, scene, options = {}) {
     modelRoot.metadata = {
         ...(modelRoot.metadata ?? {}),
         fbxAnimationControls: animationControls,
+        fbxSkeletons: loadedSkinInfos.map(skinInfo => skinInfo.skeleton),
     };
-    if (animationControls.length && modelRoot.onDisposeObservable) {
+    if ((animationControls.length || loadedSkinInfos.length) && modelRoot.onDisposeObservable) {
         modelRoot.onDisposeObservable.add(() => {
             for (const control of animationControls) control.dispose();
+            for (const skinInfo of loadedSkinInfos) skinInfo.skeleton.dispose();
         });
     }
 
