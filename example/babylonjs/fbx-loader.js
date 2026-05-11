@@ -187,10 +187,12 @@ function buildVertexData(geoNode, geometryTransform = null, skinWeightsByVertex 
 
     // --- UVs ---
     const uvNode   = findNode(geoNode.children, 'LayerElementUV');
-    let uvVals = null, uvIdx = null;
+    let uvVals = null, uvIdx = null, uvMapping = 'ByPolygonVertex', uvRef = 'Direct';
     if (uvNode) {
-        uvVals = prop0(findNode(uvNode.children, 'UV'));
-        uvIdx  = prop0(findNode(uvNode.children, 'UVIndex'));
+        uvVals    = prop0(findNode(uvNode.children, 'UV'));
+        uvIdx     = prop0(findNode(uvNode.children, 'UVIndex'));
+        uvMapping = prop0(findNode(uvNode.children, 'MappingInformationType')) ?? uvMapping;
+        uvRef     = prop0(findNode(uvNode.children, 'ReferenceInformationType')) ?? uvRef;
     }
 
     // --- Vertex Colors ---
@@ -250,6 +252,8 @@ function buildVertexData(geoNode, geometryTransform = null, skinWeightsByVertex 
                     let ni;
                     if (normMapping === 'ByPolygonVertex') {
                         ni = normRef === 'IndexToDirect' ? normIdx[pvI] : pvI;
+                    } else if (normMapping === 'ByVertice' || normMapping === 'ByVertex') {
+                        ni = normRef === 'IndexToDirect' ? normIdx[posI] : posI;
                     } else {
                         ni = normRef === 'IndexToDirect' ? normIdx[polyGlobal] : polyGlobal;
                     }
@@ -264,7 +268,14 @@ function buildVertexData(geoNode, geometryTransform = null, skinWeightsByVertex 
 
                 // UV: pass through raw FBX UVs; Babylon.js Texture default invertY=true handles V flip
                 if (uvVals) {
-                    const ui = uvIdx ? uvIdx[pvI] : pvI;
+                    let ui;
+                    if (uvMapping === 'ByPolygonVertex') {
+                        ui = uvRef === 'IndexToDirect' ? uvIdx[pvI] : pvI;
+                    } else if (uvMapping === 'ByVertice' || uvMapping === 'ByVertex') {
+                        ui = uvRef === 'IndexToDirect' ? uvIdx[posI] : posI;
+                    } else {
+                        ui = uvRef === 'IndexToDirect' ? uvIdx[polyGlobal] : polyGlobal;
+                    }
                     uvs.push(uvVals[ui * 2], uvVals[ui * 2 + 1]);
                 }
 
@@ -273,6 +284,8 @@ function buildVertexData(geoNode, geometryTransform = null, skinWeightsByVertex 
                     let ci;
                     if (colMapping === 'ByPolygonVertex') {
                         ci = colRef === 'IndexToDirect' ? colIdx[pvI] : pvI;
+                    } else if (colMapping === 'ByVertice' || colMapping === 'ByVertex') {
+                        ci = colRef === 'IndexToDirect' ? colIdx[posI] : posI;
                     } else {
                         ci = colRef === 'IndexToDirect' ? colIdx[polyGlobal] : polyGlobal;
                     }
@@ -629,6 +642,58 @@ async function loadFBX(url, scene, options = {}) {
 
         if (!boneModelIds.length) return null;
 
+        // Add bridge bones: LimbNode ancestors that have no vertex weights themselves
+        // but sit between two skinned bones (e.g. clavicles between Neck and UpperArm).
+        // Walk up from each skinned bone; if a skinned ancestor is found before the
+        // scene root, every intermediate LimbNode/Root bone in the chain is a bridge.
+        {
+            const boneSet = new Set(boneModelIds);
+            const bridgeBones = [];
+            for (const boneModelId of boneModelIds) {
+                const chain = [];
+                let parentId = nodeToParent.get(boneModelId);
+                while (parentId && parentId !== 0 && allModelById.has(parentId)) {
+                    if (boneSet.has(parentId)) {
+                        for (const bid of chain) {
+                            const btype = allModelById.get(bid)?.props[2];
+                            if ((btype === 'LimbNode' || btype === 'Root') && !boneSet.has(bid)) {
+                                boneSet.add(bid);
+                                bridgeBones.push(bid);
+                            }
+                        }
+                        break;
+                    }
+                    chain.push(parentId);
+                    parentId = nodeToParent.get(parentId);
+                }
+            }
+            boneModelIds.push(...bridgeBones);
+        }
+
+        // Climb up one level from the current skeleton root bones. If all roots share a
+        // single LimbNode/Root parent that is not yet in the skeleton, add it so it can
+        // be animated. Without this, the top-most biped bone (e.g. "Bip001") becomes a
+        // static TransformNode whose rotation is never updated, corrupting skinning.
+        // We intentionally stop after one level — climbing further risks adding FBX
+        // container/grouping nodes (which also use LimbNode type) that have non-trivial
+        // transforms, which would corrupt the skeleton's world-space positions.
+        {
+            const tempSet = new Set(boneModelIds);
+            const tempRoots = boneModelIds.filter(id => !tempSet.has(nodeToParent.get(id)));
+            const rootParentIds = [...new Set(
+                tempRoots.map(id => nodeToParent.get(id)).filter(id => id && id !== 0)
+            )];
+            if (rootParentIds.length === 1) {
+                const parentId = rootParentIds[0];
+                if (!tempSet.has(parentId) && allModelById.has(parentId)) {
+                    const ptype = allModelById.get(parentId)?.props[2];
+                    if (ptype === 'LimbNode' || ptype === 'Root') {
+                        boneModelIds.push(parentId);
+                    }
+                }
+            }
+        }
+
         const { orderedBoneIds, rootBoneIds, boneModelSet } = orderBoneModelIds(boneModelIds);
         const boneKey = orderedBoneIds.join('|');
         let shared = sharedSkeletonByBoneKey.get(boneKey);
@@ -686,20 +751,20 @@ async function loadFBX(url, scene, options = {}) {
         return weightsByVertex;
     }
 
-    function getPrimaryAnimationLayerId() {
-        let bestLayerId = null;
-        let bestCount = 0;
-        const counts = new Map();
-        for (const layerId of animCurveNodeToLayer.values()) {
-            counts.set(layerId, (counts.get(layerId) ?? 0) + 1);
-        }
-        for (const [layerId, count] of counts) {
-            if (count > bestCount) {
-                bestLayerId = layerId;
-                bestCount = count;
+    function getAllAnimationLayerIds() {
+        // Return one layerId per AnimationStack, in FBX file order.
+        const seen = new Set();
+        const result = [];
+        for (const stackId of animStackById.keys()) {
+            for (const [layerId, sid] of animLayerToStack) {
+                if (sid === stackId && !seen.has(layerId)) {
+                    seen.add(layerId);
+                    result.push(layerId);
+                    break;
+                }
             }
         }
-        return bestLayerId;
+        return result;
     }
 
     function makeAnimationChannel(curveNodeId) {
@@ -717,8 +782,7 @@ async function loadFBX(url, scene, options = {}) {
         };
     }
 
-    function createSkeletonAnimationRuntime(skinInfo) {
-        const layerId = getPrimaryAnimationLayerId();
+    function createSkeletonAnimationRuntime(skinInfo, layerId) {
         if (!layerId || !skinInfo?.boneByModelId?.size) return null;
 
         const channelsByBoneModelId = new Map();
@@ -798,12 +862,12 @@ async function loadFBX(url, scene, options = {}) {
         if (typeof skinInfo.skeleton.prepare === 'function') skinInfo.skeleton.prepare();
     }
 
-    function createSkeletonAnimationControl(skinInfo, runtime) {
+    function createSkeletonAnimationControl(skinInfo, runtime, initiallyPlaying = true) {
         const control = {
             name: runtime.name,
             duration: runtime.duration,
             time: 0,
-            playing: options.animation !== false,
+            playing: initiallyPlaying && options.animation !== false,
             observer: null,
             setTime(time) {
                 this.time = ((time % runtime.duration) + runtime.duration) % runtime.duration;
@@ -985,22 +1049,35 @@ async function loadFBX(url, scene, options = {}) {
     allCreatedNodes.push(modelRoot);
 
     const loadedSkinInfos = uniqueSkinInfos([...skinInfoBySkinId.values()]);
-    const animationControls = [];
-    for (const skinInfo of loadedSkinInfos) {
-        const runtime = createSkeletonAnimationRuntime(skinInfo);
-        if (!runtime) continue;
-        const control = createSkeletonAnimationControl(skinInfo, runtime);
-        animationControls.push(control);
-        console.log(`[FBX] Animation: ${runtime.name} duration=${runtime.duration.toFixed(3)}s bones=${runtime.channelsByBoneModelId.size}`);
+    const allAnimationControls = [];
+    const animationClips = []; // [{ name, controls }]
+
+    const layerIds = getAllAnimationLayerIds();
+    for (let clipIdx = 0; clipIdx < layerIds.length; clipIdx++) {
+        const layerId = layerIds[clipIdx];
+        const stackId = animLayerToStack.get(layerId);
+        const clipName = animStackById.get(stackId)?.props[1]?.split('\0')[0] ?? `clip_${clipIdx}`;
+        const isFirstClip = clipIdx === 0;
+        const clipControls = [];
+        for (const skinInfo of loadedSkinInfos) {
+            const runtime = createSkeletonAnimationRuntime(skinInfo, layerId);
+            if (!runtime) continue;
+            const control = createSkeletonAnimationControl(skinInfo, runtime, isFirstClip);
+            clipControls.push(control);
+            allAnimationControls.push(control);
+            console.log(`[FBX] Animation "${runtime.name}" duration=${runtime.duration.toFixed(3)}s bones=${runtime.channelsByBoneModelId.size}`);
+        }
+        if (clipControls.length) animationClips.push({ name: clipName, controls: clipControls });
     }
     modelRoot.metadata = {
         ...(modelRoot.metadata ?? {}),
-        fbxAnimationControls: animationControls,
+        fbxAnimationControls: allAnimationControls,
+        fbxAnimationClips: animationClips,
         fbxSkeletons: loadedSkinInfos.map(skinInfo => skinInfo.skeleton),
     };
-    if ((animationControls.length || loadedSkinInfos.length) && modelRoot.onDisposeObservable) {
+    if ((allAnimationControls.length || loadedSkinInfos.length) && modelRoot.onDisposeObservable) {
         modelRoot.onDisposeObservable.add(() => {
-            for (const control of animationControls) control.dispose();
+            for (const control of allAnimationControls) control.dispose();
             for (const skinInfo of loadedSkinInfos) skinInfo.skeleton.dispose();
         });
     }

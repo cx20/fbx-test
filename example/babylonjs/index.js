@@ -29,6 +29,7 @@ let engine, scene, canvas, camera;
 let importedMeshes = [];
 let gui, animationFolder, timeController;
 let activeAnimations = [];
+let allClips = []; // [{ name, controls }]
 let isLoading = false;
 
 function setStatus(msg) {
@@ -89,6 +90,7 @@ function getAnimationTime() {
 const PARAMS = {
     asset: getInitialSelection(),
     animate: getAnimationEnabled(),
+    clip: '',
     time: getAnimationTime() ?? 0,
     debug: showDebugLayer,
 };
@@ -129,6 +131,7 @@ async function loadModel(selection) {
         importedMeshes.forEach(m => m.dispose());
         importedMeshes = [];
         activeAnimations = [];
+        allClips = [];
         rebuildAnimationFolder();
 
         const url = customUrl ?? (FBX_BASE + selection.split('/').map(encodeURIComponent).join('/') + '.fbx');
@@ -162,35 +165,70 @@ async function loadModel(selection) {
     }
 }
 
-function getAnimationControls() {
-    const controls = [];
+function getAnimationClips() {
+    const clips = [];
     importedMeshes.forEach(node => {
-        const nodeControls = node.metadata?.fbxAnimationControls;
-        if (Array.isArray(nodeControls)) controls.push(...nodeControls);
+        const nodeClips = node.metadata?.fbxAnimationClips;
+        if (Array.isArray(nodeClips)) clips.push(...nodeClips);
     });
-    return controls;
+    return clips;
+}
+
+function buildTimeController(duration) {
+    if (timeController) timeController.destroy();
+    PARAMS.time = 0;
+    timeController = animationFolder.add(PARAMS, 'time', 0, duration, 0.01)
+        .name('time')
+        .onChange(value => {
+            activeAnimations.forEach(ctrl => ctrl.setTime(value));
+        });
+}
+
+function switchToClip(clip) {
+    activeAnimations.forEach(ctrl => ctrl.setPlaying(false));
+    activeAnimations = clip.controls;
+    const duration = Math.max(...activeAnimations.map(ctrl => ctrl.duration), 0);
+    buildTimeController(duration);
+    activeAnimations.forEach(ctrl => {
+        ctrl.setTime(0);
+        ctrl.setPlaying(PARAMS.animate);
+    });
+    timeController.updateDisplay();
 }
 
 function rebuildAnimationFolder() {
     [...animationFolder.children].forEach(child => child.destroy());
     animationFolder.hide();
+    timeController = null;
 
-    activeAnimations = getAnimationControls();
-    if (!activeAnimations.length) return;
+    allClips = getAnimationClips();
+    if (!allClips.length) return;
 
-    PARAMS.animate = activeAnimations.some(animation => animation.playing);
-    PARAMS.time = getAnimationTime() ?? activeAnimations[0].time;
     animationFolder.show();
+
+    if (allClips.length > 1) {
+        const clipOptions = {};
+        allClips.forEach(clip => { clipOptions[clip.name] = clip.name; });
+        PARAMS.clip = allClips[0].name;
+        animationFolder.add(PARAMS, 'clip', clipOptions).name('clip')
+            .onChange(clipName => {
+                const clip = allClips.find(c => c.name === clipName);
+                if (clip) switchToClip(clip);
+            });
+    }
+
+    activeAnimations = allClips[0].controls;
+    PARAMS.animate = getAnimationEnabled();
+    PARAMS.time = getAnimationTime() ?? 0;
+    activeAnimations.forEach(ctrl => ctrl.setPlaying(PARAMS.animate));
+
     animationFolder.add(PARAMS, 'animate').name('play').onChange(value => {
-        activeAnimations.forEach(animation => animation.setPlaying(value));
+        activeAnimations.forEach(ctrl => ctrl.setPlaying(value));
     });
-    const duration = Math.max(...activeAnimations.map(animation => animation.duration));
-    timeController = animationFolder.add(PARAMS, 'time', 0, duration, 0.01)
-        .name('time')
-        .onChange(value => {
-            activeAnimations.forEach(animation => animation.setTime(value));
-        });
-    activeAnimations.forEach(animation => animation.setTime(PARAMS.time));
+
+    const duration = Math.max(...activeAnimations.map(ctrl => ctrl.duration), 0);
+    buildTimeController(duration);
+    activeAnimations.forEach(ctrl => ctrl.setTime(PARAMS.time));
     timeController.updateDisplay();
 }
 
