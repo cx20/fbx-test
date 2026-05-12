@@ -1028,7 +1028,15 @@ async function loadFBX(url, scene, options = {}) {
         };
     }
 
+    let _applySkeletonCallCount = 0;
     function applySkeletonAnimation(skinInfo, runtime, time) {
+        const isFirstCall = _applySkeletonCallCount === 0;
+        _applySkeletonCallCount++;
+
+        if (isFirstCall) {
+            console.log(`[FBX] applySkeletonAnimation first call: skeleton="${skinInfo.skeleton.name}" _numBonesWithLinked=${skinInfo.skeleton._numBonesWithLinkedTransformNode ?? 'N/A'} _isDirty=${skinInfo.skeleton._isDirty ?? 'N/A'} time=${time.toFixed(4)}`);
+        }
+
         for (const [boneModelId, channels] of runtime.channelsByBoneModelId) {
             const bone = skinInfo.boneByModelId.get(boneModelId);
             const modelNode = allModelById.get(boneModelId);
@@ -1060,7 +1068,14 @@ async function loadFBX(url, scene, options = {}) {
                 boneNode.scaling.copyFrom(scaling);
             }
         }
+
+        if (isFirstCall) {
+            console.log(`[FBX] before prepare: _isDirty=${skinInfo.skeleton._isDirty ?? 'N/A'} _needInitialSkinMatrix=${skinInfo.skeleton._needInitialSkinMatrix ?? 'N/A'}`);
+        }
         if (typeof skinInfo.skeleton.prepare === 'function') skinInfo.skeleton.prepare();
+        if (isFirstCall) {
+            console.log(`[FBX] after  prepare: _isDirty=${skinInfo.skeleton._isDirty ?? 'N/A'}`);
+        }
     }
 
     function createSkeletonAnimationControl(skinInfo, runtime, initiallyPlaying = true) {
@@ -1084,9 +1099,15 @@ async function loadFBX(url, scene, options = {}) {
             },
         };
 
+        console.log(`[FBX] createSkeletonAnimationControl: name="${runtime.name}" initiallyPlaying=${initiallyPlaying} options.animation=${options.animation} control.playing=${control.playing}`);
         control.setTime(Number.isFinite(options.animationTime) ? options.animationTime : 0);
         let _prevMs = performance.now();
+        let _frameCount = 0;
         control.observer = scene.onBeforeRenderObservable.add(() => {
+            _frameCount++;
+            if (_frameCount <= 3) {
+                console.log(`[FBX] observer frame#${_frameCount}: control.playing=${control.playing} time=${control.time.toFixed(4)}`);
+            }
             if (!control.playing) return;
             const now = performance.now();
             const delta = Math.min((now - _prevMs) / 1000, 0.1);
@@ -1301,18 +1322,16 @@ async function loadFBX(url, scene, options = {}) {
                 ? createTransformNodeForModel(rootParentIds[0])
                 : createSyntheticArmatureNode(skinInfo);
 
+            let linkedCount = 0;
             for (const boneModelId of skinInfo.orderedBoneIds) {
                 const boneNode = createTransformNodeForModel(boneModelId);
                 if (!boneNode) continue;
                 skinInfo.nodeByModelId.set(boneModelId, boneNode);
 
-                // Link bone → TransformNode so skeleton.prepare() always recomputes
-                // bone matrices from the node's world matrix. This bypasses the
-                // dirty-flag caching issue in Babylon.js 7+ / 9.x where
-                // bone.updateMatrix() alone does not reliably force a GPU matrix update.
                 const bone = skinInfo.boneByModelId.get(boneModelId);
                 if (bone && typeof bone.linkTransformNode === 'function') {
                     bone.linkTransformNode(boneNode);
+                    linkedCount++;
                 }
 
                 const parentId = nodeToParent.get(boneModelId);
@@ -1320,6 +1339,7 @@ async function loadFBX(url, scene, options = {}) {
                     boneNode.parent = armatureNode;
                 }
             }
+            console.log(`[FBX] skeleton "${skinInfo.skeleton.name}" bones=${skinInfo.skeleton.bones.length} linked=${linkedCount} _numBonesWithLinkedTransformNode=${skinInfo.skeleton._numBonesWithLinkedTransformNode ?? 'N/A'}`);
         }
     }
 
