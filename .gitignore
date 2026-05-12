@@ -5,3 +5,6 @@ Thumbs.db
 # Editor
 .vscode/
 *.swp
+
+# Claude Code worktrees
+.claude/
