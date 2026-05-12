@@ -1083,10 +1083,12 @@ async function loadFBX(url, scene, options = {}) {
         };
 
         control.setTime(Number.isFinite(options.animationTime) ? options.animationTime : 0);
+        let _prevMs = performance.now();
         control.observer = scene.onBeforeRenderObservable.add(() => {
             if (!control.playing) return;
-            const engine = scene.getEngine?.();
-            const delta = engine ? engine.getDeltaTime() / 1000 : 1 / 60;
+            const now = performance.now();
+            const delta = Math.min((now - _prevMs) / 1000, 0.1);
+            _prevMs = now;
             control.setTime(control.time + delta);
         });
         return control;
@@ -1152,10 +1154,12 @@ async function loadFBX(url, scene, options = {}) {
         };
 
         control.setTime(Number.isFinite(options.animationTime) ? options.animationTime : 0);
+        let _prevMs = performance.now();
         control.observer = scene.onBeforeRenderObservable.add(() => {
             if (!control.playing) return;
-            const engine = scene.getEngine?.();
-            const delta = engine ? engine.getDeltaTime() / 1000 : 1 / 60;
+            const now = performance.now();
+            const delta = Math.min((now - _prevMs) / 1000, 0.1);
+            _prevMs = now;
             control.setTime(control.time + delta);
         });
         return control;
