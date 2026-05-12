@@ -81,24 +81,24 @@ const nodes = await FBXLoader.loadFBXFromBuffer(buffer, baseDir, scene, options)
 
 ### Babylon.js Scene Loader Plugin
 
-`fbx-loader.js` automatically registers itself as a Babylon.js Scene Loader Plugin when included, enabling the standard `SceneLoader` API for `.fbx` files.
+`fbx-loader.js` automatically registers itself as a Babylon.js Scene Loader Plugin when included, enabling the standard scene loader API for `.fbx` files.
 
 ```js
-// Load via SceneLoader.ImportMeshAsync
-const result = await BABYLON.SceneLoader.ImportMeshAsync('', 'assets/', 'model.fbx', scene);
+// Babylon.js v9+: pass a single full URL
+const result = await BABYLON.ImportMeshAsync('https://example.com/assets/model.fbx', scene);
 console.log(result.meshes);      // BABYLON.Mesh[]
 console.log(result.skeletons);   // BABYLON.Skeleton[]
 
 // Load into an AssetContainer (can be added/removed from scene later)
-const container = await BABYLON.LoadAssetContainerAsync('assets/model.fbx', scene);
+const container = await BABYLON.LoadAssetContainerAsync('https://example.com/assets/model.fbx', scene);
 container.addAllToScene();
 ```
 
-Loader options can be passed via `pluginOptions` (Babylon.js v9+):
+Loader options can be passed via `pluginOptions`:
 
 ```js
-const result = await BABYLON.SceneLoader.ImportMeshAsync('', 'assets/', 'model.fbx', scene, null, null, null, {
-    pluginOptions: { fbx: { animation: true, animationTime: 0 } },
+const result = await BABYLON.ImportMeshAsync('https://example.com/assets/model.fbx', scene, {
+    pluginOptions: { fbx: { animation: false, animationTime: 2.0 } },
 });
 ```
 
@@ -110,6 +110,14 @@ BABYLON.RegisterSceneLoaderPlugin({
     extensions: '.fbx',
     createPlugin: (opts) => FBXLoader.createPlugin(opts?.fbx ?? {}),
 });
+```
+
+#### Babylon.js v8 and earlier
+
+For Babylon.js v8 and earlier, use the `SceneLoader` class methods with a split `rootUrl` + `fileName`:
+
+```js
+const result = await BABYLON.SceneLoader.ImportMeshAsync('', 'https://example.com/assets/', 'model.fbx', scene);
 ```
 
 ### Animation Control
@@ -162,7 +170,8 @@ The root node's `metadata.fbxSkeletons` contains an array of `BABYLON.Skeleton` 
     });
 
     // Or via the Scene Loader Plugin (auto-registered when fbx-loader.js is included)
-    // await BABYLON.SceneLoader.ImportMeshAsync('', '', 'model.fbx', scene);
+    // await BABYLON.ImportMeshAsync('https://example.com/model.fbx', scene);  // v9+
+    // await BABYLON.SceneLoader.ImportMeshAsync('', '', 'model.fbx', scene);  // v8
 
     engine.runRenderLoop(() => scene.render());
     window.addEventListener('resize', () => engine.resize());
