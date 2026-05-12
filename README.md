@@ -37,6 +37,10 @@ Legend:
 
 A standalone binary and ASCII FBX parser and Babylon.js mesh builder. No build step or npm install required — just include it as a `<script>` tag.
 
+### Architecture
+
+![fbx-loader.js Architecture](docs/fbx-loader-architecture.svg)
+
 ### Installation
 
 ```html
