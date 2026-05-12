@@ -1028,15 +1028,7 @@ async function loadFBX(url, scene, options = {}) {
         };
     }
 
-    let _applySkeletonCallCount = 0;
     function applySkeletonAnimation(skinInfo, runtime, time) {
-        const isFirstCall = _applySkeletonCallCount === 0;
-        _applySkeletonCallCount++;
-
-        if (isFirstCall) {
-            console.log(`[FBX] applySkeletonAnimation first call: skeleton="${skinInfo.skeleton.name}" _numBonesWithLinked=${skinInfo.skeleton._numBonesWithLinkedTransformNode ?? 'N/A'} _isDirty=${skinInfo.skeleton._isDirty ?? 'N/A'} time=${time.toFixed(4)}`);
-        }
-
         for (const [boneModelId, channels] of runtime.channelsByBoneModelId) {
             const bone = skinInfo.boneByModelId.get(boneModelId);
             const modelNode = allModelById.get(boneModelId);
@@ -1068,14 +1060,7 @@ async function loadFBX(url, scene, options = {}) {
                 boneNode.scaling.copyFrom(scaling);
             }
         }
-
-        if (isFirstCall) {
-            console.log(`[FBX] before prepare: _isDirty=${skinInfo.skeleton._isDirty ?? 'N/A'} _needInitialSkinMatrix=${skinInfo.skeleton._needInitialSkinMatrix ?? 'N/A'}`);
-        }
         if (typeof skinInfo.skeleton.prepare === 'function') skinInfo.skeleton.prepare();
-        if (isFirstCall) {
-            console.log(`[FBX] after  prepare: _isDirty=${skinInfo.skeleton._isDirty ?? 'N/A'}`);
-        }
     }
 
     function createSkeletonAnimationControl(skinInfo, runtime, initiallyPlaying = true) {
@@ -1099,15 +1084,9 @@ async function loadFBX(url, scene, options = {}) {
             },
         };
 
-        console.log(`[FBX] createSkeletonAnimationControl: name="${runtime.name}" initiallyPlaying=${initiallyPlaying} options.animation=${options.animation} control.playing=${control.playing}`);
         control.setTime(Number.isFinite(options.animationTime) ? options.animationTime : 0);
         let _prevMs = performance.now();
-        let _frameCount = 0;
         control.observer = scene.onBeforeRenderObservable.add(() => {
-            _frameCount++;
-            if (_frameCount <= 3) {
-                console.log(`[FBX] observer frame#${_frameCount}: control.playing=${control.playing} time=${control.time.toFixed(4)}`);
-            }
             if (!control.playing) return;
             const now = performance.now();
             const delta = Math.min((now - _prevMs) / 1000, 0.1);
@@ -1322,7 +1301,6 @@ async function loadFBX(url, scene, options = {}) {
                 ? createTransformNodeForModel(rootParentIds[0])
                 : createSyntheticArmatureNode(skinInfo);
 
-            let linkedCount = 0;
             for (const boneModelId of skinInfo.orderedBoneIds) {
                 const boneNode = createTransformNodeForModel(boneModelId);
                 if (!boneNode) continue;
@@ -1331,7 +1309,6 @@ async function loadFBX(url, scene, options = {}) {
                 const bone = skinInfo.boneByModelId.get(boneModelId);
                 if (bone && typeof bone.linkTransformNode === 'function') {
                     bone.linkTransformNode(boneNode);
-                    linkedCount++;
                 }
 
                 const parentId = nodeToParent.get(boneModelId);
@@ -1339,7 +1316,6 @@ async function loadFBX(url, scene, options = {}) {
                     boneNode.parent = armatureNode;
                 }
             }
-            console.log(`[FBX] skeleton "${skinInfo.skeleton.name}" bones=${skinInfo.skeleton.bones.length} linked=${linkedCount} _numBonesWithLinkedTransformNode=${skinInfo.skeleton._numBonesWithLinkedTransformNode ?? 'N/A'}`);
         }
     }
 
@@ -1494,24 +1470,29 @@ async function loadFBX(url, scene, options = {}) {
         const layerId = layerIds[clipIdx];
         const stackId = animLayerToStack.get(layerId);
         const clipName = animStackById.get(stackId)?.props[1]?.split('\0')[0] ?? `clip_${clipIdx}`;
-        const isFirstClip = clipIdx === 0;
         const clipControls = [];
         for (const skinInfo of loadedSkinInfos) {
             const runtime = createSkeletonAnimationRuntime(skinInfo, layerId);
             if (!runtime) continue;
-            const control = createSkeletonAnimationControl(skinInfo, runtime, isFirstClip);
+            const control = createSkeletonAnimationControl(skinInfo, runtime, false);
             clipControls.push(control);
             allAnimationControls.push(control);
             console.log(`[FBX] Animation "${runtime.name}" duration=${runtime.duration.toFixed(3)}s bones=${runtime.channelsByBoneModelId.size}`);
         }
         const morphRuntime = createMorphAnimationRuntime(layerId, allMorphChannels);
         if (morphRuntime) {
-            const control = createMorphAnimationControl(morphRuntime, isFirstClip);
+            const control = createMorphAnimationControl(morphRuntime, false);
             clipControls.push(control);
             allAnimationControls.push(control);
             console.log(`[FBX] Morph animation "${morphRuntime.name}" duration=${morphRuntime.duration.toFixed(3)}s targets=${morphRuntime.entries.length}`);
         }
         if (clipControls.length) animationClips.push({ name: clipName, controls: clipControls });
+    }
+    // Auto-play the first clip that produced controls. Using animationClips[0] (not
+    // clipIdx === 0) because some FBX files have a leading AnimationStack with no
+    // bone curves, causing the real animation to land on clipIdx > 0.
+    if (animationClips.length > 0 && options.animation !== false) {
+        animationClips[0].controls.forEach(ctrl => ctrl.setPlaying(true));
     }
     modelRoot.metadata = {
         ...(modelRoot.metadata ?? {}),
