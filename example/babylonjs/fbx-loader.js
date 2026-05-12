@@ -273,11 +273,19 @@ function parseProps70(node) {
 
 // ============================================================
 // Build Babylon.js VertexData from FBX Geometry node
+// posIToSlotsOut (optional): filled with baseVertexIndex → [expandedSlot, ...]
+// so morph-target deltas (keyed by base vertex index) can be re-applied
+// to the post-triangulation per-polygon-vertex slots.
 // ============================================================
-function buildVertexData(geoNode, geometryTransform = null, skinWeightsByVertex = null) {
+function buildVertexData(geoNode, geometryTransform = null, skinWeightsByVertex = null, posIToSlotsOut = null) {
     const verts    = prop0(findNode(geoNode.children, 'Vertices'));
     const polyIdx  = prop0(findNode(geoNode.children, 'PolygonVertexIndex'));
     if (!verts || !polyIdx) throw new Error('Geometry missing Vertices or PolygonVertexIndex');
+
+    if (posIToSlotsOut) {
+        posIToSlotsOut.length = verts.length / 3;
+        for (let i = 0; i < posIToSlotsOut.length; i++) posIToSlotsOut[i] = [];
+    }
 
     // --- Normals ---
     const lnNode   = findNode(geoNode.children, 'LayerElementNormal');
@@ -396,6 +404,7 @@ function buildVertexData(geoNode, geometryTransform = null, skinWeightsByVertex 
                     colors.push(colVals[ci * 4], colVals[ci * 4 + 1], colVals[ci * 4 + 2], colVals[ci * 4 + 3]);
                 }
 
+                if (posIToSlotsOut && posIToSlotsOut[posI]) posIToSlotsOut[posI].push(vertexCount);
                 indices.push(vertexCount++);
             }
         }
@@ -625,9 +634,13 @@ async function loadFBX(url, scene, options = {}) {
     const animCurveById = new Map();
     const texById   = new Map(); // id → { relativeFilename }
     const videoById = new Map(); // id → ArrayBuffer (embedded image content)
+    const blendShapeById        = new Map(); // id → Deformer(BlendShape) node
+    const blendShapeChannelById = new Map(); // id → Deformer(BlendShapeChannel) node
+    const shapeGeoById          = new Map(); // id → Geometry(Shape) node (morph delta data)
     for (const obj of objectsNode.children) {
         const id = obj.props[0];
         if (obj.name === 'Geometry' && obj.props[2] === 'Mesh') geoById.set(id, obj);
+        if (obj.name === 'Geometry' && obj.props[2] === 'Shape') shapeGeoById.set(id, obj);
         if (obj.name === 'Model') {
             allModelById.set(id, obj);
             if (obj.props[2] === 'Mesh') modelById.set(id, obj);
@@ -635,6 +648,8 @@ async function loadFBX(url, scene, options = {}) {
         if (obj.name === 'Material') matById.set(id, obj);
         if (obj.name === 'Deformer' && obj.props[2] === 'Skin') skinById.set(id, obj);
         if (obj.name === 'Deformer' && obj.props[2] === 'Cluster') clusterById.set(id, obj);
+        if (obj.name === 'Deformer' && obj.props[2] === 'BlendShape') blendShapeById.set(id, obj);
+        if (obj.name === 'Deformer' && obj.props[2] === 'BlendShapeChannel') blendShapeChannelById.set(id, obj);
         if (obj.name === 'AnimationStack') animStackById.set(id, obj);
         if (obj.name === 'AnimationLayer') animLayerById.set(id, obj);
         if (obj.name === 'AnimationCurveNode') animCurveNodeById.set(id, obj);
@@ -661,7 +676,12 @@ async function loadFBX(url, scene, options = {}) {
     const animLayerToStack = new Map(); // layerId → stackId
     const animCurveNodeToLayer = new Map(); // curveNodeId → layerId
     const animCurveNodeToTarget = new Map(); // curveNodeId → { modelId, property }
+    const animCurveNodeToMorphChannel = new Map(); // curveNodeId → { channelId, property }
     const animCurvesByNode = new Map(); // curveNodeId → AnimationCurve[3]
+    const animScalarCurveByNode = new Map(); // curveNodeId → AnimationCurve (for d|DeformPercent etc.)
+    const geoToBlendShapes      = new Map(); // geoId → blendShapeId[]
+    const blendShapeToChannels  = new Map(); // blendShapeId → channelId[]
+    const channelToShapes       = new Map(); // channelId → shapeGeoId[]
     for (const c of connList) {
         if (geoById.has(c.from) && modelById.has(c.to)) geoToModel.set(c.from, c.to);
         if (matById.has(c.from) && modelById.has(c.to)) {
@@ -681,19 +701,36 @@ async function loadFBX(url, scene, options = {}) {
         if (animCurveNodeById.has(c.from) && allModelById.has(c.to)) {
             animCurveNodeToTarget.set(c.from, { modelId: c.to, property: c.prop });
         }
+        if (animCurveNodeById.has(c.from) && blendShapeChannelById.has(c.to)) {
+            animCurveNodeToMorphChannel.set(c.from, { channelId: c.to, property: c.prop });
+        }
         if (animCurveById.has(c.from) && animCurveNodeById.has(c.to)) {
             const axis = getAnimationAxis(c.prop);
             if (axis >= 0) {
                 if (!animCurvesByNode.has(c.to)) animCurvesByNode.set(c.to, [null, null, null]);
                 animCurvesByNode.get(c.to)[axis] = animCurveById.get(c.from);
+            } else if (c.prop === 'd|DeformPercent') {
+                animScalarCurveByNode.set(c.to, animCurveById.get(c.from));
             }
+        }
+        if (blendShapeById.has(c.from) && geoById.has(c.to)) {
+            if (!geoToBlendShapes.has(c.to)) geoToBlendShapes.set(c.to, []);
+            geoToBlendShapes.get(c.to).push(c.from);
+        }
+        if (blendShapeChannelById.has(c.from) && blendShapeById.has(c.to)) {
+            if (!blendShapeToChannels.has(c.to)) blendShapeToChannels.set(c.to, []);
+            blendShapeToChannels.get(c.to).push(c.from);
+        }
+        if (shapeGeoById.has(c.from) && blendShapeChannelById.has(c.to)) {
+            if (!channelToShapes.has(c.to)) channelToShapes.set(c.to, []);
+            channelToShapes.get(c.to).push(c.from);
         }
         if (c.type === 'OO' && allModelById.has(c.from) && !nodeToParent.has(c.from)) {
             nodeToParent.set(c.from, c.to);
         }
     }
 
-    console.log(`[FBX] Geometries: ${geoById.size}, Models: ${modelById.size}, Materials: ${matById.size}, Textures: ${texById.size}, Videos: ${videoById.size}, Skins: ${skinById.size}, AnimationStacks: ${animStackById.size}`);
+    console.log(`[FBX] Geometries: ${geoById.size}, Models: ${modelById.size}, Materials: ${matById.size}, Textures: ${texById.size}, Videos: ${videoById.size}, Skins: ${skinById.size}, AnimationStacks: ${animStackById.size}, BlendShapes: ${blendShapeById.size}, BlendShapeChannels: ${blendShapeChannelById.size}, Shapes: ${shapeGeoById.size}`);
 
     // Return the material index (into the per-model materials array) used by the most polygons.
     // Parses LayerElementMaterial so multi-material meshes select their dominant material.
@@ -1055,6 +1092,75 @@ async function loadFBX(url, scene, options = {}) {
         return control;
     }
 
+    function createMorphAnimationRuntime(layerId, allChannels) {
+        if (!layerId || !allChannels.length) return null;
+
+        const targetByChannelId = new Map();
+        for (const { channelId, target } of allChannels) targetByChannelId.set(channelId, target);
+
+        const entries = []; // { target, curve }
+        let start = Infinity;
+        let stop = -Infinity;
+
+        for (const [curveNodeId, info] of animCurveNodeToMorphChannel) {
+            if (animCurveNodeToLayer.get(curveNodeId) !== layerId) continue;
+            if (info.property !== 'DeformPercent') continue;
+            const target = targetByChannelId.get(info.channelId);
+            if (!target) continue;
+            const rawCurve = animScalarCurveByNode.get(curveNodeId);
+            if (!rawCurve) continue;
+            const curve = getCurveData(rawCurve);
+            if (!curve.times.length) continue;
+            start = Math.min(start, curve.times[0]);
+            stop = Math.max(stop, curve.times[curve.times.length - 1]);
+            entries.push({ target, curve });
+        }
+
+        if (!entries.length || stop <= start) return null;
+
+        const stackId = animLayerToStack.get(layerId);
+        const stackName = animStackById.get(stackId)?.props[1]?.split('\0')[0] ?? 'animation';
+        return { name: stackName, start, stop, duration: stop - start, entries };
+    }
+
+    function applyMorphAnimation(runtime, time) {
+        for (const { target, curve } of runtime.entries) {
+            const percent = sampleCurve(curve, time, 0);
+            const influence = percent / 100;
+            target.influence = influence < 0 ? 0 : influence > 1 ? 1 : influence;
+        }
+    }
+
+    function createMorphAnimationControl(runtime, initiallyPlaying = true) {
+        const control = {
+            name: runtime.name,
+            duration: runtime.duration,
+            time: 0,
+            playing: initiallyPlaying && options.animation !== false,
+            observer: null,
+            setTime(time) {
+                this.time = ((time % runtime.duration) + runtime.duration) % runtime.duration;
+                applyMorphAnimation(runtime, runtime.start + this.time);
+            },
+            setPlaying(playing) {
+                this.playing = playing;
+            },
+            dispose() {
+                if (this.observer) scene.onBeforeRenderObservable.remove(this.observer);
+                this.observer = null;
+            },
+        };
+
+        control.setTime(Number.isFinite(options.animationTime) ? options.animationTime : 0);
+        control.observer = scene.onBeforeRenderObservable.add(() => {
+            if (!control.playing) return;
+            const engine = scene.getEngine?.();
+            const delta = engine ? engine.getDeltaTime() / 1000 : 1 / 60;
+            control.setTime(control.time + delta);
+        });
+        return control;
+    }
+
     function uniqueSkinInfos(skinInfos) {
         const seen = new Set();
         const unique = [];
@@ -1071,6 +1177,95 @@ async function loadFBX(url, scene, options = {}) {
     const createdMeshes   = [];
     const skinInfoBySkinId = new Map();
     const syntheticRootNodes = [];
+    const morphChannelsByMesh = []; // [{ mesh, channels: [{ channelId, name, target }] }]
+
+    // Build a Babylon.js MorphTargetManager from FBX BlendShape deformers.
+    // Phase 1: each BlendShapeChannel becomes one morph target — the last connected
+    // Shape is used (in-between shapes via FullWeights are ignored).
+    function buildMorphTargetManager(mesh, vd, posIToSlots, geometryTransform, blendShapeIds) {
+        const basePositions = vd.positions;
+        const baseNormals = vd.normals ?? null;
+        const channelData = [];
+
+        for (const bsId of blendShapeIds) {
+            const channelIds = blendShapeToChannels.get(bsId) ?? [];
+            for (const channelId of channelIds) {
+                const shapeIds = channelToShapes.get(channelId) ?? [];
+                if (!shapeIds.length) continue;
+
+                // Phase 1: pick the last shape (max FullWeight) — ignore in-betweens.
+                const shapeGeoId = shapeIds[shapeIds.length - 1];
+                const shapeNode = shapeGeoById.get(shapeGeoId);
+                const indexes = prop0(findNode(shapeNode.children, 'Indexes')) ?? [];
+                const deltaVerts = prop0(findNode(shapeNode.children, 'Vertices')) ?? [];
+                const deltaNormals = prop0(findNode(shapeNode.children, 'Normals'));
+                if (!indexes.length || deltaVerts.length < indexes.length * 3) continue;
+
+                const targetPositions = new Float32Array(basePositions);
+                const useNormals = !!(deltaNormals && deltaNormals.length >= indexes.length * 3 && baseNormals);
+                const targetNormals = useNormals ? new Float32Array(baseNormals) : null;
+
+                for (let i = 0; i < indexes.length; i++) {
+                    const baseI = indexes[i];
+                    const slots = posIToSlots[baseI];
+                    if (!slots || !slots.length) continue;
+
+                    // Z-negate delta (RH→LH), then apply geometry transform's rotation+scale.
+                    let dx = deltaVerts[i * 3];
+                    let dy = deltaVerts[i * 3 + 1];
+                    let dz = -deltaVerts[i * 3 + 2];
+                    if (geometryTransform) {
+                        const sx = dx * geometryTransform.scaling.x;
+                        const sy = dy * geometryTransform.scaling.y;
+                        const sz = dz * geometryTransform.scaling.z;
+                        const r = rotateVectorByQuaternion(sx, sy, sz, geometryTransform.rotation);
+                        dx = r[0]; dy = r[1]; dz = r[2];
+                    }
+                    for (const slot of slots) {
+                        targetPositions[slot * 3]     += dx;
+                        targetPositions[slot * 3 + 1] += dy;
+                        targetPositions[slot * 3 + 2] += dz;
+                    }
+
+                    if (useNormals) {
+                        let nx = deltaNormals[i * 3];
+                        let ny = deltaNormals[i * 3 + 1];
+                        let nz = -deltaNormals[i * 3 + 2];
+                        if (geometryTransform) {
+                            const sx = geometryTransform.scaling.x !== 0 ? nx / geometryTransform.scaling.x : nx;
+                            const sy = geometryTransform.scaling.y !== 0 ? ny / geometryTransform.scaling.y : ny;
+                            const sz = geometryTransform.scaling.z !== 0 ? nz / geometryTransform.scaling.z : nz;
+                            const r = rotateVectorByQuaternion(sx, sy, sz, geometryTransform.rotation);
+                            nx = r[0]; ny = r[1]; nz = r[2];
+                        }
+                        for (const slot of slots) {
+                            targetNormals[slot * 3]     += nx;
+                            targetNormals[slot * 3 + 1] += ny;
+                            targetNormals[slot * 3 + 2] += nz;
+                        }
+                    }
+                }
+
+                const channelNode = blendShapeChannelById.get(channelId);
+                const rawChannelName = (channelNode.props[1] ?? '').split('\0')[0];
+                const channelName = rawChannelName.replace(/SubDeformer$/, '').trim() || `morph_${channelId}`;
+                const channelP70 = parseProps70(findNode(channelNode.children, 'Properties70'));
+                const defaultPercent = channelP70.get('DeformPercent') ?? 0;
+
+                const target = new BABYLON.MorphTarget(channelName, defaultPercent / 100, scene);
+                target.setPositions(targetPositions);
+                if (targetNormals) target.setNormals(targetNormals);
+                channelData.push({ channelId, name: channelName, target });
+            }
+        }
+
+        if (!channelData.length) return channelData;
+
+        const manager = new BABYLON.MorphTargetManager(scene);
+        for (const { target } of channelData) manager.addTarget(target);
+        mesh.morphTargetManager = manager;
+        return channelData;
+    }
 
     function createSyntheticArmatureNode(skinInfo) {
         const armature = new BABYLON.TransformNode(skinInfo.skeleton.name || 'Armature', scene);
@@ -1131,9 +1326,19 @@ async function loadFBX(url, scene, options = {}) {
             skinInfo = skinInfoBySkinId.get(skinId);
         }
         const skinWeightsByVertex = buildSkinWeightsByVertex(geoNode, skinInfo);
-        const vd   = buildVertexData(geoNode, geometryTransform, skinWeightsByVertex);
+        const blendShapeIds = geoToBlendShapes.get(geoId) ?? [];
+        const posIToSlots = blendShapeIds.length ? [] : null;
+        const vd   = buildVertexData(geoNode, geometryTransform, skinWeightsByVertex, posIToSlots);
         const mesh = new BABYLON.Mesh(meshName, scene);
         vd.applyToMesh(mesh);
+
+        if (blendShapeIds.length && posIToSlots) {
+            const channels = buildMorphTargetManager(mesh, vd, posIToSlots, geometryTransform, blendShapeIds);
+            if (channels.length) {
+                morphChannelsByMesh.push({ mesh, channels });
+                console.log(`[FBX] ${meshName} morph targets=${channels.length}`);
+            }
+        }
         if (skinInfo?.skeleton) {
             mesh.skeleton = skinInfo.skeleton;
             console.log(`[FBX] ${meshName} skin bones=${skinInfo.skeleton.bones.length}`);
@@ -1245,6 +1450,7 @@ async function loadFBX(url, scene, options = {}) {
     allCreatedNodes.push(modelRoot);
 
     const loadedSkinInfos = uniqueSkinInfos([...skinInfoBySkinId.values()]);
+    const allMorphChannels = morphChannelsByMesh.flatMap(entry => entry.channels);
     const allAnimationControls = [];
     const animationClips = []; // [{ name, controls }]
 
@@ -1263,6 +1469,13 @@ async function loadFBX(url, scene, options = {}) {
             allAnimationControls.push(control);
             console.log(`[FBX] Animation "${runtime.name}" duration=${runtime.duration.toFixed(3)}s bones=${runtime.channelsByBoneModelId.size}`);
         }
+        const morphRuntime = createMorphAnimationRuntime(layerId, allMorphChannels);
+        if (morphRuntime) {
+            const control = createMorphAnimationControl(morphRuntime, isFirstClip);
+            clipControls.push(control);
+            allAnimationControls.push(control);
+            console.log(`[FBX] Morph animation "${morphRuntime.name}" duration=${morphRuntime.duration.toFixed(3)}s targets=${morphRuntime.entries.length}`);
+        }
         if (clipControls.length) animationClips.push({ name: clipName, controls: clipControls });
     }
     modelRoot.metadata = {
@@ -1270,6 +1483,10 @@ async function loadFBX(url, scene, options = {}) {
         fbxAnimationControls: allAnimationControls,
         fbxAnimationClips: animationClips,
         fbxSkeletons: loadedSkinInfos.map(skinInfo => skinInfo.skeleton),
+        fbxMorphTargets: morphChannelsByMesh.map(entry => ({
+            mesh: entry.mesh,
+            channels: entry.channels.map(({ name, target }) => ({ name, target })),
+        })),
     };
     if ((allAnimationControls.length || loadedSkinInfos.length) && modelRoot.onDisposeObservable) {
         modelRoot.onDisposeObservable.add(() => {

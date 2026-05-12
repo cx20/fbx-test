@@ -27,7 +27,7 @@ const SEARCH_PARAMS = new URLSearchParams(window.location.search);
 
 let engine, scene, canvas, camera;
 let importedMeshes = [];
-let gui, animationFolder, timeController;
+let gui, animationFolder, morphsFolder, timeController;
 let activeAnimations = [];
 let allClips = []; // [{ name, controls }]
 let isLoading = false;
@@ -151,6 +151,7 @@ async function loadModel(selection) {
         PARAMS.asset = selection;
         frameModel(meshes);
         rebuildAnimationFolder();
+        rebuildMorphsFolder();
 
         const meshCount = meshes.filter(m => m instanceof BABYLON.Mesh).length;
         const msg = `${name} — meshes: ${meshCount}`;
@@ -194,6 +195,24 @@ function switchToClip(clip) {
         ctrl.setPlaying(PARAMS.animate);
     });
     timeController.updateDisplay();
+}
+
+function rebuildMorphsFolder() {
+    [...morphsFolder.children].forEach(child => child.destroy());
+    morphsFolder.hide();
+
+    let hasAnyTarget = false;
+    for (const node of importedMeshes) {
+        const mgr = node?.morphTargetManager;
+        if (!mgr || mgr.numTargets === 0) continue;
+        hasAnyTarget = true;
+        const meshFolder = morphsFolder.addFolder(node.name || `mesh`);
+        for (let i = 0; i < mgr.numTargets; i++) {
+            const target = mgr.getTarget(i);
+            meshFolder.add(target, 'influence', 0, 1, 0.01).name(target.name);
+        }
+    }
+    if (hasAnyTarget) morphsFolder.show();
 }
 
 function rebuildAnimationFolder() {
@@ -250,6 +269,7 @@ function initGui() {
     gui = new lil.GUI();
     gui.add(PARAMS, 'asset', getAssetOptions()).name('asset').onChange(loadModel);
     animationFolder = gui.addFolder('Animation').hide();
+    morphsFolder = gui.addFolder('Morphs').hide();
     gui.add(PARAMS, 'debug').name('Debug');
 }
 
