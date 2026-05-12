@@ -2,6 +2,8 @@
 // Binary and ASCII FBX parser + Babylon.js mesh builder
 // Supports: static mesh, basic skinning, and sampled skeleton animation (Phase 1)
 
+(function () {
+
 const FBX_TIME_UNIT_SECONDS = 1 / 46186158000;
 
 // ============================================================
@@ -1534,3 +1536,5 @@ async function loadFBX(url, scene, options = {}) {
 
 // Expose globally (for use in index.js and Babylon.js Playground)
 window.FBXLoader = { loadFBX };
+
+})();
