@@ -1306,6 +1306,15 @@ async function loadFBX(url, scene, options = {}) {
                 if (!boneNode) continue;
                 skinInfo.nodeByModelId.set(boneModelId, boneNode);
 
+                // Link bone → TransformNode so skeleton.prepare() always recomputes
+                // bone matrices from the node's world matrix. This bypasses the
+                // dirty-flag caching issue in Babylon.js 7+ / 9.x where
+                // bone.updateMatrix() alone does not reliably force a GPU matrix update.
+                const bone = skinInfo.boneByModelId.get(boneModelId);
+                if (bone && typeof bone.linkTransformNode === 'function') {
+                    bone.linkTransformNode(boneNode);
+                }
+
                 const parentId = nodeToParent.get(boneModelId);
                 if ((!parentId || parentId === 0 || !skinInfo.boneModelSet.has(parentId)) && armatureNode) {
                     boneNode.parent = armatureNode;
