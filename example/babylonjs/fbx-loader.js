@@ -599,14 +599,9 @@ function detectImageMimeType(buffer) {
 }
 
 // ============================================================
-// Main: load FBX URL and build Babylon.js meshes
+// Core: parse FBX buffer and build Babylon.js scene objects
 // ============================================================
-async function loadFBX(url, scene, options = {}) {
-    console.log(`[FBX] Fetching: ${url}`);
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${url}`);
-    const buffer = await response.arrayBuffer();
-
+async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
     console.log(`[FBX] Parsing binary FBX (${buffer.byteLength} bytes)...`);
     const { version, nodes } = await parseFBX(buffer);
     console.log(`[FBX] Version: ${version}, top-level nodes: ${nodes.map(n => n.name).join(', ')}`);
@@ -619,9 +614,6 @@ async function loadFBX(url, scene, options = {}) {
         ? connsNode.children.filter(c => c.name === 'C')
               .map(c => ({ type: c.props[0], from: c.props[1], to: c.props[2], prop: c.props[3] ?? null }))
         : [];
-
-    // Base directory URL for resolving relative texture paths
-    const baseDir = url.substring(0, url.lastIndexOf('/') + 1);
 
     // Index objects by id
     const geoById      = new Map();
@@ -1544,7 +1536,105 @@ async function loadFBX(url, scene, options = {}) {
     return allCreatedNodes;
 }
 
+// ============================================================
+// Public API
+// ============================================================
+
+async function loadFBX(url, scene, options = {}) {
+    console.log(`[FBX] Fetching: ${url}`);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${url}`);
+    const buffer = await response.arrayBuffer();
+    const baseDir = url.substring(0, url.lastIndexOf('/') + 1);
+    return _buildFBXScene(buffer, baseDir, scene, options);
+}
+
+async function loadFBXFromBuffer(buffer, baseDir, scene, options = {}) {
+    return _buildFBXScene(buffer, baseDir, scene, options);
+}
+
+// ============================================================
+// Babylon.js Scene Loader Plugin
+// ============================================================
+
+async function _pluginLoad(data, rootUrl, fileName, scene, options) {
+    if (data instanceof ArrayBuffer) {
+        return _buildFBXScene(data, rootUrl || '', scene, options);
+    }
+    return loadFBX((rootUrl || '') + (fileName || ''), scene, options);
+}
+
+function _collectMaterials(meshes) {
+    const mats = new Set();
+    for (const m of meshes) {
+        if (m.material) mats.add(m.material);
+        if (m.subMeshes) {
+            for (const sm of m.subMeshes) {
+                const mat = sm.getMaterial?.();
+                if (mat) mats.add(mat);
+            }
+        }
+    }
+    return [...mats];
+}
+
+function createFBXPlugin(defaults = {}) {
+    return {
+        name: 'fbx',
+        extensions: '.fbx',
+
+        async importMeshAsync(meshesNames, scene, data, rootUrl, onProgress, fileName, abortSignal) {
+            const nodes = await _pluginLoad(data, rootUrl, fileName, scene, { ...defaults });
+            const root = nodes.find(n => n.name === '__root__');
+            return {
+                meshes:         nodes.filter(n => n instanceof BABYLON.Mesh),
+                transformNodes: nodes.filter(n => n instanceof BABYLON.TransformNode && !(n instanceof BABYLON.Mesh)),
+                skeletons:      root?.metadata?.fbxSkeletons ?? [],
+                particleSystems: [],
+                animationGroups: [],
+                geometries: [],
+                lights: [],
+            };
+        },
+
+        async loadAsync(scene, data, rootUrl, onProgress, fileName, abortSignal) {
+            await _pluginLoad(data, rootUrl, fileName, scene, { ...defaults });
+        },
+
+        async loadAssetContainerAsync(scene, data, rootUrl, onProgress, fileName, abortSignal) {
+            const container = new BABYLON.AssetContainer(scene);
+            const nodes = await _pluginLoad(data, rootUrl, fileName, scene, { ...defaults });
+            const root = nodes.find(n => n.name === '__root__');
+            const meshes    = nodes.filter(n => n instanceof BABYLON.Mesh);
+            const tNodes    = nodes.filter(n => n instanceof BABYLON.TransformNode && !(n instanceof BABYLON.Mesh));
+            const skeletons = root?.metadata?.fbxSkeletons ?? [];
+            const materials = _collectMaterials(meshes);
+
+            container.meshes.push(...meshes);
+            container.transformNodes.push(...tNodes);
+            container.skeletons.push(...skeletons);
+            container.materials.push(...materials);
+
+            meshes.forEach(m => scene.removeMesh(m));
+            tNodes.forEach(t => scene.removeTransformNode(t));
+            skeletons.forEach(s => scene.removeSkeleton(s));
+            materials.forEach(mat => scene.removeMaterial(mat));
+
+            return container;
+        },
+    };
+}
+
+// Auto-register as Scene Loader Plugin when BABYLON is already loaded
+if (typeof BABYLON !== 'undefined' && typeof BABYLON.RegisterSceneLoaderPlugin === 'function') {
+    BABYLON.RegisterSceneLoaderPlugin({
+        name: 'fbx',
+        extensions: '.fbx',
+        createPlugin: (opts) => createFBXPlugin(opts?.fbx ?? {}),
+    });
+}
+
 // Expose globally (for use in index.js and Babylon.js Playground)
-window.FBXLoader = { loadFBX };
+window.FBXLoader = { loadFBX, loadFBXFromBuffer, createPlugin: createFBXPlugin };
 
 })();
