@@ -544,6 +544,22 @@ function makeBabylonLocalMatrix(modelNode) {
     return makeBabylonLocalMatrixFromTransform(getModelTransform(modelNode));
 }
 
+// Convert FBX TransformLink (16 float64, column-major, RH) to BABYLON.Matrix (row-major, LH).
+// Reading FBX column-major as BJS row-major is a transpose, which converts column-vector
+// convention to row-vector convention (same transformation, different notation). Then negate
+// elements where exactly one of (row==2, col==2) is true for RH→LH (Z-axis negation).
+function fbxTransformLinkToBabylon(tl) {
+    const m = new Float32Array(16);
+    for (let i = 0; i < 16; i++) m[i] = tl[i];
+    m[2]  = -m[2];
+    m[6]  = -m[6];
+    m[8]  = -m[8];
+    m[9]  = -m[9];
+    m[11] = -m[11];
+    m[14] = -m[14];
+    return BABYLON.Matrix.FromArray(m);
+}
+
 function getAnimationAxis(prop) {
     if (!prop) return -1;
     if (prop.endsWith('X')) return 0;
@@ -901,6 +917,23 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
                 const boneName = getModelDisplayName(boneModelNode, `bone_${boneModelId}`);
                 const parentBone = boneByModelId.get(nodeToParent.get(boneModelId)) ?? null;
                 const bone = new BABYLON.Bone(boneName, skeleton, parentBone, makeBabylonLocalMatrix(boneModelNode));
+
+                // Override the hierarchy-computed inverse bind pose with the FBX TransformLink matrix.
+                // TransformLink is the bone's world transform at bind time; its inverse is the exact
+                // bind-pose offset used by the FBX skinning formula. Without this, the hierarchy
+                // approximation diverges (especially for biped roots with pre-rotations), causing
+                // vertices to fly apart when animated.
+                const clusterId = clusterByBoneModelId.get(boneModelId);
+                if (clusterId !== undefined) {
+                    const clusterNode = clusterById.get(clusterId);
+                    const tlData = prop0(findNode(clusterNode.children, 'TransformLink'));
+                    if (Array.isArray(tlData) && tlData.length === 16) {
+                        const invTL = new BABYLON.Matrix();
+                        fbxTransformLinkToBabylon(tlData).invertToRef(invTL);
+                        bone._invertedAbsoluteTransform = invTL;
+                    }
+                }
+
                 boneByModelId.set(boneModelId, bone);
                 boneIndexByModelId.set(boneModelId, skeleton.bones.length - 1);
             }
@@ -1010,11 +1043,21 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
 
         const stackId = animLayerToStack.get(layerId);
         const stackName = animStackById.get(stackId)?.props[1]?.split('\0')[0] ?? 'animation';
+
+        // Use AnimationStack LocalStart to skip pre-animation keyframes (e.g. T-pose at t=0).
+        // Only apply when LocalStart falls strictly between the first and last keyframe —
+        // if LocalStart is outside the keyframe range (e.g. absolute vs relative timeline
+        // mismatch), fall back to the raw keyframe minimum to avoid negative duration.
+        const stackProps70 = parseProps70(findNode(animStackById.get(stackId)?.children ?? [], 'Properties70'));
+        const localStartRaw = stackProps70.get('LocalStart');
+        const localStartSec = typeof localStartRaw === 'number' ? localStartRaw * FBX_TIME_UNIT_SECONDS : start;
+        const clipStart = (localStartSec > start && localStartSec <= stop) ? localStartSec : start;
+
         return {
             name: stackName,
-            start,
+            start: clipStart,
             stop,
-            duration: stop - start,
+            duration: stop - clipStart,
             channelsByBoneModelId,
             elapsed: 0,
         };
@@ -1116,7 +1159,11 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
 
         const stackId = animLayerToStack.get(layerId);
         const stackName = animStackById.get(stackId)?.props[1]?.split('\0')[0] ?? 'animation';
-        return { name: stackName, start, stop, duration: stop - start, entries };
+        const stackProps70 = parseProps70(findNode(animStackById.get(stackId)?.children ?? [], 'Properties70'));
+        const localStartRaw = stackProps70.get('LocalStart');
+        const localStartSec = typeof localStartRaw === 'number' ? localStartRaw * FBX_TIME_UNIT_SECONDS : start;
+        const clipStart = (localStartSec > start && localStartSec <= stop) ? localStartSec : start;
+        return { name: stackName, start: clipStart, stop, duration: stop - clipStart, entries };
     }
 
     function applyMorphAnimation(runtime, time) {
@@ -1198,7 +1245,11 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
 
         const stackId = animLayerToStack.get(layerId);
         const stackName = animStackById.get(stackId)?.props[1]?.split('\0')[0] ?? 'animation';
-        return { name: stackName, start, stop, duration: stop - start, channelsByModelId };
+        const stackProps70 = parseProps70(findNode(animStackById.get(stackId)?.children ?? [], 'Properties70'));
+        const localStartRaw = stackProps70.get('LocalStart');
+        const localStartSec = typeof localStartRaw === 'number' ? localStartRaw * FBX_TIME_UNIT_SECONDS : start;
+        const clipStart = (localStartSec > start && localStartSec <= stop) ? localStartSec : start;
+        return { name: stackName, start: clipStart, stop, duration: stop - clipStart, channelsByModelId };
     }
 
     function applyNodeAnimation(runtime, time) {
