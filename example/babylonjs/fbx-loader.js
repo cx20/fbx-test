@@ -1449,15 +1449,26 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
             const texInfo  = texId !== undefined ? texById.get(texId)            : undefined;
             const matNode  = matId !== undefined ? matById.get(matId)            : undefined;
             const matProps = matNode ? parseProps70(findNode(matNode.children, 'Properties70')) : null;
-            const diffuseColor   = matProps?.get('Diffuse')       ?? matProps?.get('DiffuseColor');
-            const specularColor  = matProps?.get('Specular')      ?? matProps?.get('SpecularColor');
-            const emissiveColor  = matProps?.get('Emissive')      ?? matProps?.get('EmissiveColor');
-            if (Array.isArray(diffuseColor)  && diffuseColor.length  >= 3)
-                mat.diffuseColor  = new BABYLON.Color3(diffuseColor[0],  diffuseColor[1],  diffuseColor[2]);
-            if (Array.isArray(specularColor) && specularColor.length >= 3)
-                mat.specularColor = new BABYLON.Color3(specularColor[0], specularColor[1], specularColor[2]);
+            const diffuseColor   = matProps?.get('Diffuse')          ?? matProps?.get('DiffuseColor');
+            const diffuseFactor  = matProps?.get('DiffuseFactor');
+            const specularColor  = matProps?.get('Specular')         ?? matProps?.get('SpecularColor');
+            const specularFactor = matProps?.get('SpecularFactor');
+            const emissiveColor  = matProps?.get('Emissive')         ?? matProps?.get('EmissiveColor');
+            const shininess      = matProps?.get('ShininessExponent') ?? matProps?.get('Shininess');
+            if (Array.isArray(diffuseColor) && diffuseColor.length >= 3) {
+                const df = Array.isArray(diffuseFactor) ? diffuseFactor[0] : (typeof diffuseFactor === 'number' ? diffuseFactor : 1.0);
+                mat.diffuseColor = new BABYLON.Color3(diffuseColor[0] * df, diffuseColor[1] * df, diffuseColor[2] * df);
+            }
+            if (Array.isArray(specularColor) && specularColor.length >= 3) {
+                const sf = Array.isArray(specularFactor) ? specularFactor[0] : (typeof specularFactor === 'number' ? specularFactor : 1.0);
+                mat.specularColor = new BABYLON.Color3(specularColor[0] * sf, specularColor[1] * sf, specularColor[2] * sf);
+            }
             if (Array.isArray(emissiveColor) && emissiveColor.length >= 3)
                 mat.emissiveColor = new BABYLON.Color3(emissiveColor[0], emissiveColor[1], emissiveColor[2]);
+            if (Array.isArray(shininess) && shininess.length >= 1)
+                mat.specularPower = shininess[0];
+            else if (typeof shininess === 'number')
+                mat.specularPower = shininess;
             const videoContent = texId !== undefined ? videoById.get(texToVideo.get(texId)) : undefined;
             if (videoContent) {
                 const mimeType = detectImageMimeType(videoContent);
