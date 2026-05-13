@@ -1454,6 +1454,7 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
             const specularColor  = matProps?.get('Specular')         ?? matProps?.get('SpecularColor');
             const specularFactor = matProps?.get('SpecularFactor');
             const emissiveColor  = matProps?.get('Emissive')         ?? matProps?.get('EmissiveColor');
+            const emissiveFactor = matProps?.get('EmissiveFactor');
             const shininess      = matProps?.get('ShininessExponent') ?? matProps?.get('Shininess');
             if (Array.isArray(diffuseColor) && diffuseColor.length >= 3) {
                 const df = Array.isArray(diffuseFactor) ? diffuseFactor[0] : (typeof diffuseFactor === 'number' ? diffuseFactor : 1.0);
@@ -1463,8 +1464,10 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
                 const sf = Array.isArray(specularFactor) ? specularFactor[0] : (typeof specularFactor === 'number' ? specularFactor : 1.0);
                 mat.specularColor = new BABYLON.Color3(specularColor[0] * sf, specularColor[1] * sf, specularColor[2] * sf);
             }
-            if (Array.isArray(emissiveColor) && emissiveColor.length >= 3)
-                mat.emissiveColor = new BABYLON.Color3(emissiveColor[0], emissiveColor[1], emissiveColor[2]);
+            if (Array.isArray(emissiveColor) && emissiveColor.length >= 3) {
+                const ef = Array.isArray(emissiveFactor) ? emissiveFactor[0] : (typeof emissiveFactor === 'number' ? emissiveFactor : 1.0);
+                mat.emissiveColor = new BABYLON.Color3(emissiveColor[0] * ef, emissiveColor[1] * ef, emissiveColor[2] * ef);
+            }
             if (Array.isArray(shininess) && shininess.length >= 1)
                 mat.specularPower = shininess[0];
             else if (typeof shininess === 'number')
