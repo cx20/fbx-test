@@ -62,6 +62,10 @@ function getAnimationTime() {
     return Number.isFinite(time) ? time : null;
 }
 
+function getInitialClipName() {
+    return SEARCH_PARAMS.get('clip') ?? null;
+}
+
 function getScaleOverride() {
     const scale = Number(SEARCH_PARAMS.get('scale'));
     return Number.isFinite(scale) && scale > 0 ? scale : null;
@@ -122,6 +126,11 @@ function countMeshes(object) {
 function getDefaultClip(object) {
     if (!object.animations.length) return null;
     console.log('[FBX] Animation clips:', object.animations.map(clip => clip.name).join(', '));
+    const initialName = getInitialClipName();
+    if (initialName) {
+        const found = object.animations.find(clip => clip.name === initialName);
+        if (found) return found;
+    }
     return object.animations.find(clip => clip.name === 'idle') ?? object.animations[0];
 }
 

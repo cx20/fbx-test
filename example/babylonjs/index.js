@@ -27,7 +27,7 @@ const SEARCH_PARAMS = new URLSearchParams(window.location.search);
 
 let engine, scene, canvas, camera;
 let importedMeshes = [];
-let gui, animationFolder, morphsFolder, timeController;
+let gui, assetController, animationFolder, morphsFolder, timeController;
 let activeAnimations = [];
 let allClips = []; // [{ name, controls }]
 let isLoading = false;
@@ -86,6 +86,10 @@ function getAnimationTime() {
     const value = SEARCH_PARAMS.get('time');
     const time = value === null ? NaN : Number(value);
     return Number.isFinite(time) ? time : null;
+}
+
+function getInitialClipName() {
+    return SEARCH_PARAMS.get('clip') ?? null;
 }
 
 const PARAMS = {
@@ -183,7 +187,6 @@ function getAnimationClips() {
 
 function buildTimeController(duration) {
     if (timeController) timeController.destroy();
-    PARAMS.time = 0;
     timeController = animationFolder.add(PARAMS, 'time', 0, duration, 0.01)
         .name('time')
         .onChange(value => {
@@ -195,6 +198,7 @@ function switchToClip(clip) {
     activeAnimations.forEach(ctrl => ctrl.setPlaying(false));
     activeAnimations = clip.controls;
     const duration = Math.max(...activeAnimations.map(ctrl => ctrl.duration), 0);
+    PARAMS.time = 0;
     buildTimeController(duration);
     activeAnimations.forEach(ctrl => {
         ctrl.setTime(0);
@@ -231,10 +235,13 @@ function rebuildAnimationFolder() {
 
     animationFolder.show();
 
+    const initialClipName = getInitialClipName();
+    const initialClip = (initialClipName ? allClips.find(c => c.name === initialClipName) : null) ?? allClips[0];
+
     if (allClips.length > 1) {
         const clipOptions = {};
         allClips.forEach(clip => { clipOptions[clip.name] = clip.name; });
-        PARAMS.clip = allClips[0].name;
+        PARAMS.clip = initialClip.name;
         animationFolder.add(PARAMS, 'clip', clipOptions).name('clip')
             .onChange(clipName => {
                 const clip = allClips.find(c => c.name === clipName);
@@ -242,7 +249,7 @@ function rebuildAnimationFolder() {
             });
     }
 
-    activeAnimations = allClips[0].controls;
+    activeAnimations = initialClip.controls;
     PARAMS.animate = getAnimationEnabled();
     PARAMS.time = getAnimationTime() ?? 0;
     activeAnimations.forEach(ctrl => ctrl.setPlaying(PARAMS.animate));
@@ -273,7 +280,7 @@ function showDebugLayer() {
 
 function initGui() {
     gui = new lil.GUI();
-    gui.add(PARAMS, 'asset', getAssetOptions()).name('asset').onChange(loadModel);
+    assetController = gui.add(PARAMS, 'asset', getAssetOptions()).name('asset');
     animationFolder = gui.addFolder('Animation').hide();
     morphsFolder = gui.addFolder('Morphs').hide();
     gui.add(PARAMS, 'debug').name('Debug');
@@ -361,6 +368,9 @@ async function init() {
 
     // 初期モデルを読み込む
     await loadModel(initialSelection);
+    // Attach onChange only after the initial load so a browser-triggered
+    // 'change' event during GUI setup cannot preempt the initial load.
+    assetController.onChange(loadModel);
 }
 
 init();
