@@ -31,6 +31,7 @@ let gui, animationFolder, morphsFolder, timeController;
 let activeAnimations = [];
 let allClips = []; // [{ name, controls }]
 let isLoading = false;
+let shadowGenerator = null;
 
 function setStatus(msg) {
     document.getElementById('status').textContent = msg;
@@ -148,8 +149,13 @@ async function loadModel(selection) {
         }
 
         importedMeshes = meshes;
+        if (shadowGenerator) {
+            meshes.filter(m => m instanceof BABYLON.Mesh).forEach(m => {
+                shadowGenerator.addShadowCaster(m);
+                m.receiveShadows = true;
+            });
+        }
         PARAMS.asset = selection;
-        frameModel(meshes);
         rebuildAnimationFolder();
         rebuildMorphsFolder();
 
@@ -278,20 +284,74 @@ async function init() {
     engine = new BABYLON.Engine(canvas, true);
 
     scene = new BABYLON.Scene(engine);
-    scene.clearColor = new BABYLON.Color4(0.5, 0.5, 0.5, 1);
+    scene.clearColor = new BABYLON.Color4(0.627, 0.627, 0.627, 1);
+    scene.fogMode = BABYLON.Scene.FOGMODE_LINEAR;
+    scene.fogColor = new BABYLON.Color3(0.627, 0.627, 0.627);
+    scene.fogStart = 200;
+    scene.fogEnd = 1000;
 
+    // Match Three.js: camera at (100,200,300), target (0,100,0).
+    // Babylon.js is LH so Z is negated → BJS camera at (100,200,-300).
+    const _camTarget = new BABYLON.Vector3(0, 100, 0);
+    const _camOffset = new BABYLON.Vector3(100, 100, -300); // pos - target
+    const _camRadius = _camOffset.length();
     camera = new BABYLON.ArcRotateCamera(
-        'camera', -Math.PI / 2, Math.PI / 2.5, 10,
-        BABYLON.Vector3.Zero(), scene
+        'camera',
+        Math.atan2(_camOffset.z, _camOffset.x), // alpha
+        Math.acos(_camOffset.y / _camRadius),    // beta
+        _camRadius,
+        _camTarget,
+        scene
     );
     camera.attachControl(canvas, true);
     camera.wheelPrecision = 1;
-    camera.lowerRadiusLimit = 0.5;
-    camera.upperRadiusLimit = 500;
+    camera.lowerRadiusLimit = 1;
+    camera.upperRadiusLimit = 2000;
 
-    new BABYLON.HemisphericLight('hemi', new BABYLON.Vector3(0, 1, 0), scene);
-    const dir = new BABYLON.DirectionalLight('dir', new BABYLON.Vector3(-1, -2, -1), scene);
-    dir.intensity = 0.7;
+    const hemi = new BABYLON.HemisphericLight('hemi', new BABYLON.Vector3(0, 1, 0), scene);
+    hemi.groundColor = new BABYLON.Color3(0.267, 0.267, 0.267);
+    hemi.intensity = 1.0;
+    const dir = new BABYLON.DirectionalLight('dir', new BABYLON.Vector3(0, -2, 1), scene);
+    dir.position = new BABYLON.Vector3(0, 200, -100);
+    dir.intensity = 1.0;
+
+    scene.environmentTexture = new BABYLON.CubeTexture(
+        'https://cx20.github.io/gltf-test/textures/env/papermillSpecularHDR.env',
+        scene
+    );
+
+    scene.imageProcessingConfiguration.toneMappingEnabled = true;
+    scene.imageProcessingConfiguration.toneMappingType = BABYLON.ImageProcessingConfiguration.TONEMAPPING_KHR_PBR_NEUTRAL;
+    scene.imageProcessingConfiguration.exposure = 1 / 0.6 * 1.5; // ≈ 2.5: compensates for lower light intensity vs Three.js
+
+    const ground = BABYLON.MeshBuilder.CreateGround('ground', { width: 2000, height: 2000 }, scene);
+    const groundMat = new BABYLON.StandardMaterial('groundMat', scene);
+    groundMat.diffuseColor = new BABYLON.Color3(0.6, 0.6, 0.6);
+    groundMat.specularColor = new BABYLON.Color3(0, 0, 0);
+    groundMat.backFaceCulling = false;
+    groundMat.alpha = 0.8;
+    groundMat.disableDepthWrite = true;
+    ground.material = groundMat;
+    ground.receiveShadows = true;
+
+    shadowGenerator = new BABYLON.ShadowGenerator(1024, dir);
+    shadowGenerator.useBlurExponentialShadowMap = true;
+
+    (function createGrid() {
+        const size = 2000;
+        const divisions = 20;
+        const step = size / divisions;
+        const half = size / 2;
+        const lines = [];
+        for (let i = 0; i <= divisions; i++) {
+            const p = -half + i * step;
+            lines.push([new BABYLON.Vector3(-half, 0, p), new BABYLON.Vector3(half, 0, p)]);
+            lines.push([new BABYLON.Vector3(p, 0, -half), new BABYLON.Vector3(p, 0, half)]);
+        }
+        const grid = BABYLON.MeshBuilder.CreateLineSystem('grid', { lines }, scene);
+        grid.color = new BABYLON.Color3(0, 0, 0);
+        grid.alpha = 0.2;
+    })();
 
     const initialSelection = getInitialSelection();
     initGui();

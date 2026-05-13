@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+import { HDRCubeTextureLoader } from 'three/addons/loaders/HDRCubeTextureLoader.js';
 
 const ASSETS = [
     'Samba Dancing',
@@ -32,6 +33,7 @@ const SEARCH_PARAMS = new URLSearchParams(window.location.search);
 let renderer, scene, camera, controls, loader, gui, morphsFolder, animationFolder;
 let ground, grid;
 let importedObject = null;
+let iblEnvMap = null;
 let skeletonHelper = null;
 let mixer = null;
 let activeAction = null;
@@ -74,6 +76,15 @@ const PARAMS = {
     ground: true,
     grid: true,
 };
+
+function applyIBL(object) {
+    if (!iblEnvMap || !object) return;
+    object.traverse(child => {
+        if (!child.isMesh) return;
+        const mats = Array.isArray(child.material) ? child.material : [child.material];
+        mats.forEach(m => { m.envMap = iblEnvMap; m.needsUpdate = true; });
+    });
+}
 
 function disposeObject(object) {
     object.traverse(child => {
@@ -220,6 +231,7 @@ async function loadModel(name) {
         }
 
         scene.add(object);
+        applyIBL(object);
         skeletonHelper = new THREE.SkeletonHelper(object);
         skeletonHelper.visible = PARAMS.skeleton;
         scene.add(skeletonHelper);
@@ -262,6 +274,22 @@ function init() {
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.shadowMap.enabled = true;
+    renderer.toneMapping = THREE.NeutralToneMapping;
+
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    new HDRCubeTextureLoader()
+        .setPath('https://cx20.github.io/gltf-test/textures/papermill_hdr/specular/')
+        .load([
+            'specular_posx_0.hdr', 'specular_negx_0.hdr',
+            'specular_posy_0.hdr', 'specular_negy_0.hdr',
+            'specular_posz_0.hdr', 'specular_negz_0.hdr',
+        ], (hdrCubeMap) => {
+            iblEnvMap = pmremGenerator.fromCubemap(hdrCubeMap).texture;
+            scene.environment = iblEnvMap;
+            hdrCubeMap.dispose();
+            pmremGenerator.dispose();
+            if (importedObject) applyIBL(importedObject);
+        });
 
     const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 5);
     hemi.position.set(0, 200, 0);
