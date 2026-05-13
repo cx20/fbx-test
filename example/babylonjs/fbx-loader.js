@@ -1159,6 +1159,92 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
         return control;
     }
 
+    function createNodeAnimationRuntime(layerId) {
+        const allBoneModelIds = new Set();
+        for (const skinInfo of skinInfoBySkinId.values()) {
+            for (const id of skinInfo.boneByModelId.keys()) allBoneModelIds.add(id);
+        }
+
+        const channelsByModelId = new Map();
+        let start = Infinity;
+        let stop = -Infinity;
+
+        for (const [curveNodeId, target] of animCurveNodeToTarget) {
+            if (animCurveNodeToLayer.get(curveNodeId) !== layerId) continue;
+            if (allBoneModelIds.has(target.modelId)) continue;
+            if (!bjsNodeById.has(target.modelId)) continue;
+
+            const key = target.property === 'Lcl Translation'
+                ? 'T'
+                : target.property === 'Lcl Rotation'
+                    ? 'R'
+                    : target.property === 'Lcl Scaling'
+                        ? 'S'
+                        : null;
+            if (!key) continue;
+
+            const channel = makeAnimationChannel(curveNodeId);
+            for (const curve of channel.curves) {
+                if (!curve?.times.length) continue;
+                start = Math.min(start, curve.times[0]);
+                stop = Math.max(stop, curve.times[curve.times.length - 1]);
+            }
+
+            if (!channelsByModelId.has(target.modelId)) channelsByModelId.set(target.modelId, {});
+            channelsByModelId.get(target.modelId)[key] = channel;
+        }
+
+        if (!channelsByModelId.size || stop <= start) return null;
+
+        const stackId = animLayerToStack.get(layerId);
+        const stackName = animStackById.get(stackId)?.props[1]?.split('\0')[0] ?? 'animation';
+        return { name: stackName, start, stop, duration: stop - start, channelsByModelId };
+    }
+
+    function applyNodeAnimation(runtime, time) {
+        for (const [modelId, channels] of runtime.channelsByModelId) {
+            const bjsNode = bjsNodeById.get(modelId);
+            const modelNode = allModelById.get(modelId);
+            if (!bjsNode || !modelNode) continue;
+            const base = getModelTransform(modelNode);
+            const T = sampleCurveNode(channels.T, time, base.T);
+            const R = sampleCurveNode(channels.R, time, base.R);
+            const S = sampleCurveNode(channels.S, time, base.S);
+            bjsNode.position.set(T[0], T[1], -T[2]);
+            bjsNode.rotationQuaternion = fbxEulerToQuat(base.preR, 0).multiply(fbxEulerToQuat(R, base.rotOrder));
+            bjsNode.scaling.set(S[0], S[1], S[2]);
+        }
+    }
+
+    function createNodeAnimationControl(runtime, initiallyPlaying = true) {
+        const control = {
+            name: runtime.name,
+            duration: runtime.duration,
+            time: 0,
+            playing: initiallyPlaying && options.animation !== false,
+            observer: null,
+            setTime(time) {
+                this.time = ((time % runtime.duration) + runtime.duration) % runtime.duration;
+                applyNodeAnimation(runtime, runtime.start + this.time);
+            },
+            setPlaying(playing) { this.playing = playing; },
+            dispose() {
+                if (this.observer) scene.onBeforeRenderObservable.remove(this.observer);
+                this.observer = null;
+            },
+        };
+        control.setTime(Number.isFinite(options.animationTime) ? options.animationTime : 0);
+        let _prevMs = performance.now();
+        control.observer = scene.onBeforeRenderObservable.add(() => {
+            if (!control.playing) return;
+            const now = performance.now();
+            const delta = Math.min((now - _prevMs) / 1000, 0.1);
+            _prevMs = now;
+            control.setTime(control.time + delta);
+        });
+        return control;
+    }
+
     function uniqueSkinInfos(skinInfos) {
         const seen = new Set();
         const unique = [];
@@ -1363,12 +1449,15 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
             const texInfo  = texId !== undefined ? texById.get(texId)            : undefined;
             const matNode  = matId !== undefined ? matById.get(matId)            : undefined;
             const matProps = matNode ? parseProps70(findNode(matNode.children, 'Properties70')) : null;
-            const diffuseColor  = matProps?.get('Diffuse')  ?? matProps?.get('DiffuseColor');
-            const specularColor = matProps?.get('Specular') ?? matProps?.get('SpecularColor');
+            const diffuseColor   = matProps?.get('Diffuse')       ?? matProps?.get('DiffuseColor');
+            const specularColor  = matProps?.get('Specular')      ?? matProps?.get('SpecularColor');
+            const emissiveColor  = matProps?.get('Emissive')      ?? matProps?.get('EmissiveColor');
             if (Array.isArray(diffuseColor)  && diffuseColor.length  >= 3)
                 mat.diffuseColor  = new BABYLON.Color3(diffuseColor[0],  diffuseColor[1],  diffuseColor[2]);
             if (Array.isArray(specularColor) && specularColor.length >= 3)
                 mat.specularColor = new BABYLON.Color3(specularColor[0], specularColor[1], specularColor[2]);
+            if (Array.isArray(emissiveColor) && emissiveColor.length >= 3)
+                mat.emissiveColor = new BABYLON.Color3(emissiveColor[0], emissiveColor[1], emissiveColor[2]);
             const videoContent = texId !== undefined ? videoById.get(texToVideo.get(texId)) : undefined;
             if (videoContent) {
                 const mimeType = detectImageMimeType(videoContent);
@@ -1477,6 +1566,13 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
             clipControls.push(control);
             allAnimationControls.push(control);
             console.log(`[FBX] Morph animation "${morphRuntime.name}" duration=${morphRuntime.duration.toFixed(3)}s targets=${morphRuntime.entries.length}`);
+        }
+        const nodeRuntime = createNodeAnimationRuntime(layerId);
+        if (nodeRuntime) {
+            const control = createNodeAnimationControl(nodeRuntime, false);
+            clipControls.push(control);
+            allAnimationControls.push(control);
+            console.log(`[FBX] Node animation "${nodeRuntime.name}" duration=${nodeRuntime.duration.toFixed(3)}s nodes=${nodeRuntime.channelsByModelId.size}`);
         }
         if (clipControls.length) animationClips.push({ name: clipName, controls: clipControls });
     }

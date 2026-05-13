@@ -17,6 +17,11 @@ body {
   height: 100%;
 }
 
+.lil-gui.root {
+  left: 0;
+  right: auto;
+}
+
 #status {
   position: fixed;
   bottom: 10px;
