@@ -606,6 +606,49 @@ function sampleCurveNode(channel, time, fallback) {
     ];
 }
 
+// Build a quaternion keyframe track from an Euler R channel.
+// Converts each keyframe to a quaternion (including preR), enabling slerp interpolation
+// that correctly handles 180° Euler jumps (e.g. 0°→-360°, -90°→270°) that represent
+// nearly identical orientations but produce wrong results under linear Euler interp.
+function buildQuatTrack(rChannel, preR, rotOrder) {
+    if (!rChannel) return null;
+    const allTimes = new Set();
+    for (const curve of rChannel.curves) {
+        if (curve?.times) for (const t of curve.times) allTimes.add(t);
+    }
+    if (!allTimes.size) return null;
+    const sortedTimes = [...allTimes].sort((a, b) => a - b);
+    const defaults = rChannel.defaults;
+    const preQuat = fbxEulerToQuat(preR, 0);
+    const quats = sortedTimes.map(t => {
+        const rx = sampleCurve(rChannel.curves[0], t, defaults[0]);
+        const ry = sampleCurve(rChannel.curves[1], t, defaults[1]);
+        const rz = sampleCurve(rChannel.curves[2], t, defaults[2]);
+        return preQuat.multiply(fbxEulerToQuat([rx, ry, rz], rotOrder));
+    });
+    return { times: sortedTimes, quats };
+}
+
+function sampleQuatTrack(track, time) {
+    const { times, quats } = track;
+    if (time <= times[0]) return quats[0].clone();
+    const last = times.length - 1;
+    if (time >= times[last]) return quats[last].clone();
+    let lo = 0, hi = last;
+    while (lo + 1 < hi) {
+        const mid = (lo + hi) >> 1;
+        if (times[mid] <= time) lo = mid;
+        else hi = mid;
+    }
+    const span = times[hi] - times[lo] || 1;
+    const t = (time - times[lo]) / span;
+    const q0 = quats[lo];
+    const q1 = quats[hi];
+    const dot = q0.x * q1.x + q0.y * q1.y + q0.z * q1.z + q0.w * q1.w;
+    const q1s = dot < 0 ? new BABYLON.Quaternion(-q1.x, -q1.y, -q1.z, -q1.w) : q1;
+    return BABYLON.Quaternion.Slerp(q0, q1s, t);
+}
+
 // Detect image MIME type from raw bytes (for embedded FBX textures)
 function detectImageMimeType(buffer) {
     const b = new Uint8Array(buffer, 0, Math.min(4, buffer.byteLength));
@@ -1037,6 +1080,10 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
 
             if (!channelsByBoneModelId.has(target.modelId)) channelsByBoneModelId.set(target.modelId, {});
             channelsByBoneModelId.get(target.modelId)[key] = channel;
+            if (key === 'R') {
+                const { preR, rotOrder } = getModelTransform(allModelById.get(target.modelId));
+                channel.quatTrack = buildQuatTrack(channel, preR, rotOrder);
+            }
         }
 
         if (!channelsByBoneModelId.size || stop <= start) return null;
@@ -1071,15 +1118,19 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
 
             const base = getModelTransform(modelNode);
             const T = sampleCurveNode(channels.T, time, base.T);
-            const R = sampleCurveNode(channels.R, time, base.R);
             const S = sampleCurveNode(channels.S, time, base.S);
-            const matrix = makeBabylonLocalMatrixFromTransform({
-                T,
-                R,
-                S,
-                preR: base.preR,
-                rotOrder: base.rotOrder,
-            });
+            let rotation;
+            if (channels.R?.quatTrack) {
+                rotation = sampleQuatTrack(channels.R.quatTrack, time);
+            } else {
+                const R = sampleCurveNode(channels.R, time, base.R);
+                rotation = fbxEulerToQuat(base.preR, 0).multiply(fbxEulerToQuat(R, base.rotOrder));
+            }
+            const matrix = BABYLON.Matrix.Compose(
+                new BABYLON.Vector3(S[0], S[1], S[2]),
+                rotation,
+                new BABYLON.Vector3(T[0], T[1], -T[2])
+            );
 
             if (typeof bone.updateMatrix === 'function') {
                 bone.updateMatrix(matrix, false, true);
