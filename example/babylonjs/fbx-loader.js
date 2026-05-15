@@ -955,30 +955,51 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
             const boneByModelId = new Map();
             const boneIndexByModelId = new Map();
             const nodeByModelId = new Map();
+            // Pass 1: create bones and collect TransformLink matrices
+            const tlByBoneModelId = new Map(); // boneModelId -> BJS TransformLink matrix
             for (const boneModelId of orderedBoneIds) {
                 const boneModelNode = allModelById.get(boneModelId);
                 const boneName = getModelDisplayName(boneModelNode, `bone_${boneModelId}`);
                 const parentBone = boneByModelId.get(nodeToParent.get(boneModelId)) ?? null;
                 const bone = new BABYLON.Bone(boneName, skeleton, parentBone, makeBabylonLocalMatrix(boneModelNode));
+                boneByModelId.set(boneModelId, bone);
+                boneIndexByModelId.set(boneModelId, skeleton.bones.length - 1);
 
-                // Override the hierarchy-computed inverse bind pose with the FBX TransformLink matrix.
-                // TransformLink is the bone's world transform at bind time; its inverse is the exact
-                // bind-pose offset used by the FBX skinning formula. Without this, the hierarchy
-                // approximation diverges (especially for biped roots with pre-rotations), causing
-                // vertices to fly apart when animated.
                 const clusterId = clusterByBoneModelId.get(boneModelId);
                 if (clusterId !== undefined) {
                     const clusterNode = clusterById.get(clusterId);
                     const tlData = prop0(findNode(clusterNode.children, 'TransformLink'));
                     if (Array.isArray(tlData) && tlData.length === 16) {
-                        const invTL = new BABYLON.Matrix();
-                        fbxTransformLinkToBabylon(tlData).invertToRef(invTL);
-                        bone._invertedAbsoluteTransform = invTL;
+                        tlByBoneModelId.set(boneModelId, fbxTransformLinkToBabylon(tlData));
                     }
                 }
+            }
 
-                boneByModelId.set(boneModelId, bone);
-                boneIndexByModelId.set(boneModelId, skeleton.bones.length - 1);
+            // Pass 2: override bind matrices from TransformLink (parent-first order).
+            // The FBX TransformLink is the bone's world transform at bind time. The hierarchy
+            // LclR/LclT values may represent a different rest pose than the actual bind pose,
+            // so we must use TransformLink rather than the hierarchy approximation.
+            // Strategy: derive a local bind matrix for each bone so that when accumulated
+            // through the parent chain it exactly reproduces the TransformLink world matrix.
+            //   localBind = tl_child_bjs * inv(tl_parent_bjs)
+            // Calling bone.updateMatrix(localBind, true) then propagates correctly through
+            // _updateAbsoluteBindMatrices, giving absoluteInverseBindMatrix = inv(tl_bjs).
+            for (const boneModelId of orderedBoneIds) {
+                const tl_bjs = tlByBoneModelId.get(boneModelId);
+                if (!tl_bjs) continue;
+                const bone = boneByModelId.get(boneModelId);
+                if (!bone) continue;
+                const parentTL = tlByBoneModelId.get(nodeToParent.get(boneModelId));
+                let localBind;
+                if (parentTL) {
+                    const parentTLInv = new BABYLON.Matrix();
+                    parentTL.invertToRef(parentTLInv);
+                    localBind = new BABYLON.Matrix();
+                    tl_bjs.multiplyToRef(parentTLInv, localBind);
+                } else {
+                    localBind = tl_bjs.clone();
+                }
+                bone.updateMatrix(localBind, true, false);
             }
             shared = {
                 skeleton,
