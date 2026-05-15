@@ -966,6 +966,10 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
                 // bind-pose offset used by the FBX skinning formula. Without this, the hierarchy
                 // approximation diverges (especially for biped roots with pre-rotations), causing
                 // vertices to fly apart when animated.
+                // _invertedAbsoluteTransform: BJS v5 field (read directly by _computeTransformMatrices).
+                // _absoluteInverseBindMatrix: BJS v9 field (getInvertedAbsoluteTransform() now delegates
+                //   to getAbsoluteInverseBindMatrix() which returns this field, so the v5 override is
+                //   silently ignored in v9 — must also set this field for v9+ compatibility).
                 const clusterId = clusterByBoneModelId.get(boneModelId);
                 if (clusterId !== undefined) {
                     const clusterNode = clusterById.get(clusterId);
@@ -973,7 +977,8 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
                     if (Array.isArray(tlData) && tlData.length === 16) {
                         const invTL = new BABYLON.Matrix();
                         fbxTransformLinkToBabylon(tlData).invertToRef(invTL);
-                        bone._invertedAbsoluteTransform = invTL;
+                        bone._invertedAbsoluteTransform = invTL;   // BJS v5
+                        bone._absoluteInverseBindMatrix = invTL;   // BJS v9+
                     }
                 }
 
