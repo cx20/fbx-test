@@ -24,6 +24,7 @@ const ASSETS = [
     'test/anim_root_motion',
     // glTF sample models converted to FBX
     'gltf/AnimatedTriangle',
+    'gltf/SimpleSkin',
     'gltf/RiggedSimple',
     'gltf/RiggedFigure',
     'gltf/Fox',
@@ -81,14 +82,21 @@ function getScaleOverride() {
     return Number.isFinite(scale) && scale > 0 ? scale : null;
 }
 
+function getBoolParam(key, defaultValue) {
+    const value = SEARCH_PARAMS.get(key);
+    if (value === null) return defaultValue;
+    return !['0', 'false', 'off', 'no'].includes(value.toLowerCase());
+}
+
 const PARAMS = {
     asset: getInitialModel(),
     animate: getAnimationEnabled(),
     time: getAnimationTime() ?? 0,
     clip: '',
-    skeleton: false,
-    ground: true,
-    grid: true,
+    skeleton: getBoolParam('skeleton', false),
+    fog: getBoolParam('fog', true),
+    ground: getBoolParam('ground', true),
+    grid: getBoolParam('grid', true),
 };
 
 function applyIBL(object) {
@@ -169,6 +177,7 @@ function setObjectVisibility() {
     if (skeletonHelper) skeletonHelper.visible = PARAMS.skeleton;
     if (ground) ground.visible = PARAMS.ground;
     if (grid) grid.visible = PARAMS.grid;
+    scene.fog = PARAMS.fog ? new THREE.Fog(0xa0a0a0, 200, 1000) : null;
 }
 
 function rebuildAnimationFolder(object) {
@@ -273,6 +282,7 @@ function initGui() {
     gui = new GUI();
     gui.add(PARAMS, 'asset', ASSETS).name('asset').onChange(loadModel);
     gui.add(PARAMS, 'skeleton').name('skeleton').onChange(setObjectVisibility);
+    gui.add(PARAMS, 'fog').name('fog').onChange(setObjectVisibility);
     gui.add(PARAMS, 'ground').name('ground').onChange(setObjectVisibility);
     gui.add(PARAMS, 'grid').name('grid').onChange(setObjectVisibility);
     animationFolder = gui.addFolder('Animation').hide();
@@ -284,7 +294,7 @@ function init() {
 
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0xa0a0a0);
-    scene.fog = new THREE.Fog(0xa0a0a0, 200, 1000);
+    if (PARAMS.fog) scene.fog = new THREE.Fog(0xa0a0a0, 200, 1000);
 
     camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 2000);
     camera.position.set(100, 200, 300);
@@ -329,11 +339,13 @@ function init() {
     );
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
+    ground.visible = PARAMS.ground;
     scene.add(ground);
 
     grid = new THREE.GridHelper(2000, 20, 0x000000, 0x000000);
     grid.material.opacity = 0.2;
     grid.material.transparent = true;
+    grid.visible = PARAMS.grid;
     scene.add(grid);
 
     controls = new OrbitControls(camera, renderer.domElement);
