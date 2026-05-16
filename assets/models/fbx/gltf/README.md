@@ -20,6 +20,17 @@ Source repository: [cx20/gltf-test](https://github.com/cx20/gltf-test)
 
 ---
 
+## SimpleSkin.fbx
+
+| Item | Value |
+|------|-------|
+| Source | `tutorialModels/SimpleSkin/glTF/SimpleSkin.gltf` |
+| Content | Flat 2×5 vertex plane that bends around the middle joint |
+| Skeleton | Yes (2 bones: `Node_1` → `Node_2`) |
+| Purpose | Minimal skinning test — the simplest possible weighted skin |
+
+---
+
 ## RiggedSimple.fbx
 
 | Item | Value |
