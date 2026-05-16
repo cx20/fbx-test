@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebGPU + FBX Example</title>
+  <link rel="stylesheet" type="text/css" href="style.css">
+  <script src="https://unpkg.com/gl-matrix@3.4.4/gl-matrix-min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.20/dist/lil-gui.umd.min.js"></script>
+</head>
+<body>
+
+<script id="wgsl" type="x-shader/wgsl">
+// Uniform layout — single buffer per mesh, all values updated per frame.
+//
+// WGSL alignment rules (std140-style) require vec3/vec4/mat3/mat4 fields to
+// sit on 16-byte boundaries; using mat4 in place of mat3 for `normalMat` and
+// padding scalars to vec4 avoids hand-counting offsets.
+struct Uniforms {
+    viewProj:     mat4x4f,
+    model:        mat4x4f,
+    normalMat:    mat4x4f,
+    baseColor:    vec4f,
+    lightDir:     vec4f, // .xyz used
+    ambient:      vec4f, // .x used
+    morphWeights: vec4f,
+    flags:        vec4u, // x=hasVertexColor y=hasTexture z=skinned
+    bones:        array<mat4x4f, 64>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+struct VsIn {
+    @location(0) position:   vec3f,
+    @location(1) normal:     vec3f,
+    @location(2) color:      vec4f,
+    @location(3) texCoord:   vec2f,
+    @location(4) boneIndex:  vec4f,
+    @location(5) boneWeight: vec4f,
+    @location(6) morph0:     vec3f,
+    @location(7) morph1:     vec3f,
+    @location(8) morph2:     vec3f,
+    @location(9) morph3:     vec3f,
+};
+
+struct VsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) normal:   vec3f,
+    @location(1) color:    vec4f,
+    @location(2) texCoord: vec2f,
+};
+
+@vertex
+fn vsMain(in: VsIn) -> VsOut {
+    let morphed = in.position
+        + in.morph0 * u.morphWeights.x
+        + in.morph1 * u.morphWeights.y
+        + in.morph2 * u.morphWeights.z
+        + in.morph3 * u.morphWeights.w;
+    var worldPos: vec4f;
+    var worldNrm: vec3f;
+    if (u.flags.z != 0u) {
+        let skin =
+            u.bones[u32(in.boneIndex.x)] * in.boneWeight.x +
+            u.bones[u32(in.boneIndex.y)] * in.boneWeight.y +
+            u.bones[u32(in.boneIndex.z)] * in.boneWeight.z +
+            u.bones[u32(in.boneIndex.w)] * in.boneWeight.w;
+        worldPos = skin * vec4f(morphed, 1.0);
+        worldNrm = (skin * vec4f(in.normal, 0.0)).xyz;
+    } else {
+        worldPos = u.model * vec4f(morphed, 1.0);
+        worldNrm = (u.normalMat * vec4f(in.normal, 0.0)).xyz;
+    }
+    var out: VsOut;
+    out.pos = u.viewProj * worldPos;
+    out.normal = normalize(worldNrm);
+    out.color = in.color;
+    out.texCoord = in.texCoord;
+    return out;
+}
+
+@fragment
+fn fsMain(in: VsOut) -> @location(0) vec4f {
+    let N = normalize(in.normal);
+    let diffuse = max(dot(N, normalize(u.lightDir.xyz)), 0.0);
+    let shade = u.ambient.x + (1.0 - u.ambient.x) * diffuse;
+    var base: vec4f;
+    if (u.flags.y != 0u) {
+        base = textureSample(tex, samp, in.texCoord);
+    } else if (u.flags.x != 0u) {
+        base = in.color;
+    } else {
+        base = u.baseColor;
+    }
+    return vec4f(base.rgb * shade, base.a);
+}
+</script>
+
+<div id="status"></div>
+<canvas id="c"></canvas>
+
+<script src="fbx-parser.js"></script>
+<script src="index.js"></script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+* {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+}
+
+body {
+    background: #a0a0a0;
+    font: 13px sans-serif;
+}
+
+canvas {
+    display: block;
+}
+
+#status {
+    position: fixed;
+    bottom: 8px;
+    left: 8px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    padding: 4px 8px;
+    border-radius: 4px;
+    font: 13px monospace;
+    pointer-events: none;
+    z-index: 10;
+}
