@@ -148,8 +148,8 @@ function resize() {
 function getProps70(modelNode) {
     const p70 = findNode(modelNode.children, 'Properties70');
     const out = {
-        T: [0,0,0], R: [0,0,0], S: [1,1,1], preR: [0,0,0], rotOrder: 0,
-        geoT: [0,0,0], geoR: [0,0,0], geoS: [1,1,1],
+        T: [0, 0, 0], R: [0, 0, 0], S: [1, 1, 1], preR: [0, 0, 0], rotOrder: 0,
+        geoT: [0, 0, 0], geoR: [0, 0, 0], geoS: [1, 1, 1],
     };
     if (!p70) return out;
     for (const p of p70.children) {
@@ -285,7 +285,7 @@ function buildMesh(geoNode) {
         normals:   new Float32Array(outNormals),
         colors:    new Float32Array(outColors),
         uvs:       new Float32Array(outUVs),
-        indices:   outIndices,               // plain number[] — typed in uploadMesh
+        indices:   outIndices,               // plain number[] — converted to Uint16Array/Uint32Array in uploadMesh
         triangleCount: outIndices.length / 3,
         hasVertexColor: !!colorsData,
         hasUVs: !!uvsData,
@@ -310,7 +310,7 @@ function uploadMesh(meshData) {
     gl.bufferData(gl.ARRAY_BUFFER, meshData.uvs, gl.STATIC_DRAW);
 
     // Use Uint32 indices for meshes with more than 65535 expanded vertices
-    const needU32 = meshData.positions.length / 3 > 65535;
+    const needU32 = meshData.positions.length / 3 >= 65536;
     const idxData = needU32 ? new Uint32Array(meshData.indices) : new Uint16Array(meshData.indices);
     const idxType = needU32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
 
@@ -662,11 +662,11 @@ function render(timeMs) {
     gl.uniform1f(uniforms.ambient, 0.25);
     gl.uniform1i(uniforms.texture, 0);
 
+    const scaleMat = scene.scale !== 1 ? mat4.fromScaling(mat4.create(), [scene.scale, scene.scale, scene.scale]) : null;
     for (const mesh of scene.meshes) {
         const model = getWorldMatrix(mesh.modelId, PARAMS.time, scene);
-        if (scene.scale !== 1) {
-            const s = scene.scale;
-            mat4.multiply(model, mat4.fromScaling(mat4.create(), [s, s, s]), model);
+        if (scaleMat) {
+            mat4.multiply(model, scaleMat, model);
         }
         const normalMat = mat3.create();
         mat3.normalFromMat4(normalMat, model);
