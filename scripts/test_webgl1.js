@@ -3,10 +3,12 @@ const { chromium } = require('playwright');
 const path = require('path');
 
 const MODELS = [
-    { name: 'vCube',                 file: 'vcube',              time: 0 },
-    { name: 'gltf/AnimatedTriangle', file: 'animated-triangle-t0', time: 0 },
-    { name: 'gltf/AnimatedTriangle', file: 'animated-triangle-t05', time: 0.5 },
-    { name: 'gltf/AnimatedTriangle', file: 'animated-triangle-t10', time: 1.0 },
+    { name: 'vCube',                    file: 'vcube',                    time: 0 },
+    { name: 'gltf/AnimatedTriangle',    file: 'animated-triangle-t0',     time: 0 },
+    { name: 'gltf/AnimatedTriangle',    file: 'animated-triangle-t05',    time: 0.5 },
+    { name: 'gltf/AnimatedTriangle',    file: 'animated-triangle-t10',    time: 1.0 },
+    { name: 'monkey',                   file: 'monkey',                   time: 0 },
+    { name: 'monkey_embedded_texture',  file: 'monkey-embedded',          time: 0 },
 ];
 
 (async () => {

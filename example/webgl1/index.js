@@ -10,8 +10,10 @@ const { parseFBX, findNode, findNodes, prop0, FBX_TIME_UNIT_SECONDS } = window.F
 const { mat4, mat3, vec3 } = window.glMatrix;
 
 const ASSETS = [
-    { name: 'vCube',                 url: '../../assets/models/fbx/vCube.fbx' },
-    { name: 'gltf/AnimatedTriangle', url: '../../assets/models/fbx/gltf/AnimatedTriangle.fbx' },
+    { name: 'monkey',                   url: '../../assets/models/fbx/monkey.fbx' },
+    { name: 'monkey_embedded_texture',  url: '../../assets/models/fbx/monkey_embedded_texture.fbx' },
+    { name: 'vCube',                    url: '../../assets/models/fbx/vCube.fbx' },
+    { name: 'gltf/AnimatedTriangle',    url: '../../assets/models/fbx/gltf/AnimatedTriangle.fbx' },
 ];
 
 const SEARCH_PARAMS = new URLSearchParams(window.location.search);
@@ -76,6 +78,7 @@ function initGL() {
         position: gl.getAttribLocation(program, 'aPosition'),
         normal:   gl.getAttribLocation(program, 'aNormal'),
         color:    gl.getAttribLocation(program, 'aColor'),
+        texCoord: gl.getAttribLocation(program, 'aTexCoord'),
     };
     uniforms = {
         viewProj:        gl.getUniformLocation(program, 'uViewProj'),
@@ -85,6 +88,8 @@ function initGL() {
         lightDir:        gl.getUniformLocation(program, 'uLightDir'),
         ambient:         gl.getUniformLocation(program, 'uAmbient'),
         hasVertexColor:  gl.getUniformLocation(program, 'uHasVertexColor'),
+        hasTexture:      gl.getUniformLocation(program, 'uHasTexture'),
+        texture:         gl.getUniformLocation(program, 'uTexture'),
     };
 
     gl.clearColor(0.627, 0.627, 0.627, 1.0);
@@ -181,6 +186,7 @@ function buildMesh(geoNode) {
 
     const normalsData = readLayer('LayerElementNormal', 'Normals', 'NormalsIndex');
     const colorsData  = readLayer('LayerElementColor',  'Colors',  'ColorIndex');
+    const uvsData     = readLayer('LayerElementUV',     'UV',      'UVIndex');
 
     function lookup(layer, stride, pvIdx, polyIdx, vIdx, fallback) {
         if (!layer) return fallback;
@@ -200,6 +206,7 @@ function buildMesh(geoNode) {
     const outPositions = [];
     const outNormals   = [];
     const outColors    = [];
+    const outUVs       = [];
     const outIndices   = [];
     let polyCornerStart = 0;
     let polyId = 0;
@@ -214,6 +221,8 @@ function buildMesh(geoNode) {
         outNormals.push(n[0], n[1], n[2]);
         const c = lookup(colorsData, 4, i, polyId, v, [1, 1, 1, 1]);
         outColors.push(c[0], c[1], c[2], c[3]);
+        const uv = lookup(uvsData, 2, i, polyId, v, [0, 0]);
+        outUVs.push(uv[0], uv[1]);
 
         if (isEnd) {
             for (let j = polyCornerStart + 1; j < i; j++) {
@@ -228,9 +237,11 @@ function buildMesh(geoNode) {
         positions: new Float32Array(outPositions),
         normals:   new Float32Array(outNormals),
         colors:    new Float32Array(outColors),
+        uvs:       new Float32Array(outUVs),
         indices:   new Uint16Array(outIndices),
         triangleCount: outIndices.length / 3,
         hasVertexColor: !!colorsData,
+        hasUVs: !!uvsData,
     };
 }
 
@@ -247,14 +258,19 @@ function uploadMesh(meshData) {
     gl.bindBuffer(gl.ARRAY_BUFFER, colorBuf);
     gl.bufferData(gl.ARRAY_BUFFER, meshData.colors, gl.STATIC_DRAW);
 
+    const uvBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, meshData.uvs, gl.STATIC_DRAW);
+
     const idxBuf = gl.createBuffer();
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, meshData.indices, gl.STATIC_DRAW);
 
     return {
-        posBuf, normBuf, colorBuf, idxBuf,
+        posBuf, normBuf, colorBuf, uvBuf, idxBuf,
         count: meshData.indices.length,
         hasVertexColor: meshData.hasVertexColor,
+        hasUVs: meshData.hasUVs,
     };
 }
 
@@ -362,6 +378,65 @@ function sampleAnimation(animation, time, baseTRS) {
 }
 
 // =====================================================================
+// Texture loading
+// =====================================================================
+
+function createGLTexture(img) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    return tex;
+}
+
+function loadTextureFromUrl(url) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => resolve(createGLTexture(img));
+        img.onerror = () => reject(new Error(`Failed to load texture: ${url}`));
+        img.src = url;
+    });
+}
+
+function loadTextureFromBytes(bytes) {
+    const blob = new Blob([bytes], { type: 'image/png' });
+    const url = URL.createObjectURL(blob);
+    return loadTextureFromUrl(url).finally(() => URL.revokeObjectURL(url));
+}
+
+// Find a texture in FBX: returns { type:'embedded', content:ArrayBuffer }
+// or { type:'external', url:string }, or null.
+function extractTextureInfo(nodes, assetUrl) {
+    const objects = findNode(nodes, 'Objects');
+    if (!objects) return null;
+    const baseUrl = assetUrl.substring(0, assetUrl.lastIndexOf('/') + 1);
+    for (const vid of findNodes(objects.children, 'Video')) {
+        const contentNode = findNode(vid.children, 'Content');
+        if (contentNode && contentNode.props[0] instanceof ArrayBuffer) {
+            return { type: 'embedded', content: contentNode.props[0] };
+        }
+        const relNode = findNode(vid.children, 'RelativeFilename');
+        if (relNode && relNode.props[0]) {
+            const rel = relNode.props[0].replace(/\\/g, '/');
+            return { type: 'external', url: baseUrl + rel };
+        }
+    }
+    return null;
+}
+
+async function loadTexture(nodes, assetUrl) {
+    const info = extractTextureInfo(nodes, assetUrl);
+    if (!info) return null;
+    if (info.type === 'embedded') return loadTextureFromBytes(info.content);
+    return loadTextureFromUrl(info.url);
+}
+
+// =====================================================================
 // Scene state
 // =====================================================================
 
@@ -394,7 +469,12 @@ async function loadModel(name) {
     const baseTRS = getProps70(meshModel);
     const animation = buildAnimation(nodes, meshModel.props[0]);
 
-    scene = { gpu, baseTRS, animation, modelName: name };
+    let texture = null;
+    if (meshData.hasUVs) {
+        try { texture = await loadTexture(nodes, asset.url); } catch (e) { console.warn('Texture load failed:', e); }
+    }
+
+    scene = { gpu, baseTRS, animation, texture, modelName: name };
     setStatus(`${name} — triangles: ${meshData.triangleCount}${animation ? ` — anim ${animation.duration.toFixed(2)}s` : ''}`);
 }
 
@@ -429,6 +509,8 @@ function render(timeMs) {
     const normalMat = mat3.create();
     mat3.normalFromMat4(normalMat, model);
 
+    const hasTexture = !!(scene.texture && scene.gpu.hasUVs);
+
     gl.useProgram(program);
     gl.uniformMatrix4fv(uniforms.viewProj, false, viewProj);
     gl.uniformMatrix4fv(uniforms.model,    false, model);
@@ -437,6 +519,13 @@ function render(timeMs) {
     gl.uniform3f(uniforms.lightDir, 0.3, 1.0, 0.5);
     gl.uniform1f(uniforms.ambient, 0.25);
     gl.uniform1i(uniforms.hasVertexColor, scene.gpu.hasVertexColor ? 1 : 0);
+    gl.uniform1i(uniforms.hasTexture, hasTexture ? 1 : 0);
+    gl.uniform1i(uniforms.texture, 0);
+
+    if (hasTexture) {
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, scene.texture);
+    }
 
     gl.bindBuffer(gl.ARRAY_BUFFER, scene.gpu.posBuf);
     gl.enableVertexAttribArray(attribs.position);
@@ -449,6 +538,10 @@ function render(timeMs) {
     gl.bindBuffer(gl.ARRAY_BUFFER, scene.gpu.colorBuf);
     gl.enableVertexAttribArray(attribs.color);
     gl.vertexAttribPointer(attribs.color, 4, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, scene.gpu.uvBuf);
+    gl.enableVertexAttribArray(attribs.texCoord);
+    gl.vertexAttribPointer(attribs.texCoord, 2, gl.FLOAT, false, 0, 0);
 
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, scene.gpu.idxBuf);
     gl.drawElements(gl.TRIANGLES, scene.gpu.count, gl.UNSIGNED_SHORT, 0);
