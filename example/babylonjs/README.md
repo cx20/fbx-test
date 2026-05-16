@@ -16,6 +16,11 @@ the arms in the Babylon.js viewer stay nearly horizontal (T-pose-like), whereas
 the Three.js viewer correctly drops them to an A-pose angle. The legs and torso
 look approximately correct; only the shoulder rotation diverges.
 
+| Babylon.js (current) | Three.js (reference) |
+|---|---|
+| ![BJS shoulder ROM stuck at T-pose](images/riggedfigure-shoulder-rom-bjs.png) | ![Three.js shoulder ROM at A-pose](images/riggedfigure-shoulder-rom-threejs.png) |
+| Arms held horizontal; the bones drawn by `BABYLON.Debug.SkeletonViewer` (red) match the Three.js positions, so the bone *hierarchy* is correct — only the mesh skinning fails to track the shoulder rotation. | Arms angled downward as the animation intends (the clip oscillates the shoulder rotation around `Rz`). |
+
 **Reproduction.**
 
 ```
