@@ -269,7 +269,7 @@ function buildMesh(geoNode) {
         const c = lookup(colorsData, 4, i, polyId, v, [1, 1, 1, 1]);
         outColors.push(c[0], c[1], c[2], c[3]);
         const uv = lookup(uvsData, 2, i, polyId, v, [0, 0]);
-        outUVs.push(uv[0], uv[1]);
+        outUVs.push(uv[0], 1.0 - uv[1]); // FBX UV V=0 is top; WebGL V=0 is bottom
 
         if (isEnd) {
             for (let j = polyCornerStart + 1; j < i; j++) {
