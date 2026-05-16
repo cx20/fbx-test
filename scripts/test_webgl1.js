@@ -9,6 +9,16 @@ const MODELS = [
     { name: 'gltf/AnimatedTriangle',    file: 'animated-triangle-t10',    time: 1.0 },
     { name: 'monkey',                   file: 'monkey',                   time: 0 },
     { name: 'monkey_embedded_texture',  file: 'monkey-embedded',          time: 0 },
+    { name: 'Samba Dancing',            file: 'samba-dancing',            time: 0 },
+    { name: 'archer/ArcherRi01',        file: 'archer',                   time: 0 },
+    { name: 'warrior/Warrior',          file: 'warrior',                  time: 0 },
+    { name: 'stanford-bunny',           file: 'bunny',                    time: 0 },
+    { name: 'Head_69',                  file: 'head',                     time: 0 },
+    { name: 'RotationTest',             file: 'rotation-test',            time: 0 },
+    { name: 'exampleWindow',            file: 'example-window',           time: 0 },
+    { name: 'mixamo',                   file: 'mixamo',                   time: 0 },
+    { name: 'test/anim_euler_jump',     file: 'anim-euler-jump',          time: 0 },
+    { name: 'test/anim_root_motion',    file: 'anim-root-motion',         time: 0 },
 ];
 
 (async () => {
