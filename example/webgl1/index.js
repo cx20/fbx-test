@@ -36,7 +36,8 @@ const ASSETS = [
 ];
 
 const FBX_BASE = '../../assets/models/fbx/';
-const MAX_BONES = 64; // must match uBones[] in vertex shader
+const MAX_BONES  = 64; // must match uBones[] in vertex shader
+const MAX_MORPHS = 4;  // must match aMorph0..3 / uMorphWeights in vertex shader
 
 const SCALES = new Map([
     ['warrior/Warrior',    100],
@@ -67,6 +68,7 @@ const PARAMS = {
     asset:    getInitialModel(),
     animate:  getBoolParam('animation', true),
     time:     Number(SEARCH_PARAMS.get('time')) || 0,
+    morph:    Number(SEARCH_PARAMS.get('morph')) || 0,
 };
 
 // =====================================================================
@@ -115,6 +117,12 @@ function initGL() {
         texCoord:   gl.getAttribLocation(program, 'aTexCoord'),
         boneIndex:  gl.getAttribLocation(program, 'aBoneIndex'),
         boneWeight: gl.getAttribLocation(program, 'aBoneWeight'),
+        morph:      [
+            gl.getAttribLocation(program, 'aMorph0'),
+            gl.getAttribLocation(program, 'aMorph1'),
+            gl.getAttribLocation(program, 'aMorph2'),
+            gl.getAttribLocation(program, 'aMorph3'),
+        ],
     };
     uniforms = {
         viewProj:        gl.getUniformLocation(program, 'uViewProj'),
@@ -128,6 +136,7 @@ function initGL() {
         texture:         gl.getUniformLocation(program, 'uTexture'),
         skinned:         gl.getUniformLocation(program, 'uSkinned'),
         bones:           gl.getUniformLocation(program, 'uBones'),
+        morphWeights:    gl.getUniformLocation(program, 'uMorphWeights'),
     };
 
     gl.clearColor(0.627, 0.627, 0.627, 1.0);
@@ -216,7 +225,9 @@ function makeLocalMatrix(T, preR, R, S) {
 //
 // If `skinPerVertex` is provided ({ boneIndices, boneWeights }), per-vertex
 // skinning attributes (4 bones per vertex) are expanded alongside positions.
-function buildMesh(geoNode, skinPerVertex) {
+// If `morphDeltas` is provided (Float32Array[], one per channel), per-vertex
+// position deltas are expanded alongside positions.
+function buildMesh(geoNode, skinPerVertex, morphDeltas) {
     const verts = prop0(findNode(geoNode.children, 'Vertices'));
     const polyIdxNode = findNode(geoNode.children, 'PolygonVertexIndex');
     if (!verts || !polyIdxNode) return null;
@@ -264,6 +275,8 @@ function buildMesh(geoNode, skinPerVertex) {
     const outUVs       = [];
     const outBoneIdx   = [];
     const outBoneWt    = [];
+    const morphCount   = morphDeltas ? morphDeltas.length : 0;
+    const outMorphs    = morphDeltas ? morphDeltas.map(() => []) : [];
     const outIndices   = [];
     let polyCornerStart = 0;
     let polyId = 0;
@@ -286,6 +299,10 @@ function buildMesh(geoNode, skinPerVertex) {
             outBoneIdx.push(bi[v*4], bi[v*4+1], bi[v*4+2], bi[v*4+3]);
             outBoneWt.push (bw[v*4], bw[v*4+1], bw[v*4+2], bw[v*4+3]);
         }
+        for (let m = 0; m < morphCount; m++) {
+            const d = morphDeltas[m];
+            outMorphs[m].push(d[v*3], d[v*3+1], d[v*3+2]);
+        }
 
         if (isEnd) {
             for (let j = polyCornerStart + 1; j < i; j++) {
@@ -303,6 +320,7 @@ function buildMesh(geoNode, skinPerVertex) {
         uvs:       new Float32Array(outUVs),
         boneIndices: skinPerVertex ? new Float32Array(outBoneIdx) : null,
         boneWeights: skinPerVertex ? new Float32Array(outBoneWt)  : null,
+        morphs:    outMorphs.map(a => new Float32Array(a)),
         indices:   outIndices,               // plain number[] — converted to Uint16Array/Uint32Array in uploadMesh
         triangleCount: outIndices.length / 3,
         hasVertexColor: !!colorsData,
@@ -338,6 +356,14 @@ function uploadMesh(meshData) {
         gl.bufferData(gl.ARRAY_BUFFER, meshData.boneWeights, gl.STATIC_DRAW);
     }
 
+    const morphBufs = [];
+    for (const m of meshData.morphs) {
+        const b = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, b);
+        gl.bufferData(gl.ARRAY_BUFFER, m, gl.STATIC_DRAW);
+        morphBufs.push(b);
+    }
+
     // Use Uint32 indices for meshes with more than 65535 expanded vertices
     const needU32 = meshData.positions.length / 3 > 65535;
     const idxData = needU32 ? new Uint32Array(meshData.indices) : new Uint16Array(meshData.indices);
@@ -348,7 +374,7 @@ function uploadMesh(meshData) {
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idxData, gl.STATIC_DRAW);
 
     return {
-        posBuf, normBuf, colorBuf, uvBuf, boneIdxBuf, boneWtBuf, idxBuf, idxType,
+        posBuf, normBuf, colorBuf, uvBuf, boneIdxBuf, boneWtBuf, morphBufs, idxBuf, idxType,
         count: meshData.indices.length,
         hasVertexColor: meshData.hasVertexColor,
         hasUVs: meshData.hasUVs,
@@ -440,6 +466,49 @@ function buildAnimation(roots, modelId) {
 
     if (duration === 0) return null;
     return { channels, duration };
+}
+
+// Walk Connections to find an AnimationCurveNode targeting `channelId`'s
+// DeformPercent (BlendShapeChannel weight). Returns a single curve or null.
+function buildMorphAnimation(roots, channelId) {
+    const objects = findNode(roots, 'Objects');
+    const conns   = findNode(roots, 'Connections');
+    if (!objects || !conns) return null;
+
+    const acnById = new Map();
+    for (const n of findNodes(objects.children, 'AnimationCurveNode')) {
+        acnById.set(n.props[0], n);
+    }
+    const curveById = new Map();
+    for (const n of findNodes(objects.children, 'AnimationCurve')) {
+        curveById.set(n.props[0], n);
+    }
+
+    // Find ACN that targets DeformPercent on this channel.
+    let targetAcn = null;
+    for (const c of conns.children) {
+        if (c.name !== 'C' || c.props[0] !== 'OP') continue;
+        const [, fromId, toId, prop] = c.props;
+        if (toId === channelId && acnById.has(fromId) && prop === 'DeformPercent') {
+            targetAcn = fromId; break;
+        }
+    }
+    if (targetAcn === null) return null;
+
+    // Find the scalar curve attached to that ACN (FBX uses d|DeformPercent).
+    let curveData = null;
+    for (const c of conns.children) {
+        if (c.name !== 'C' || c.props[0] !== 'OP') continue;
+        const [, fromId, toId, prop] = c.props;
+        if (toId === targetAcn && curveById.has(fromId)
+                && (prop === 'd|DeformPercent' || prop === 'd|X')) {
+            curveData = getCurveData(curveById.get(fromId)); break;
+        }
+    }
+    if (!curveData || !curveData.times.length) return null;
+
+    const duration = curveData.times[curveData.times.length - 1];
+    return { curve: curveData, duration };
 }
 
 function sampleAnimation(animation, time, baseTRS) {
@@ -610,6 +679,73 @@ function buildSkinForGeometry(geoNode, vertexCount, conns, deformerById, modelBy
     return { boneModelIds, bindInverses, boneIndices, boneWeights };
 }
 
+// Gather morph-target info for a Geometry node, if it has a BlendShape
+// deformer chain. Returns:
+//   { channels: [{ channelId, deltas: Float32Array(vertexCount * 3) }] }
+// or null. Up to MAX_MORPHS channels per geometry. For a channel with multiple
+// in-between shapes we use only the last shape (matches Babylon's loader).
+function buildMorphForGeometry(geoNode, vertexCount, conns, geoById, deformerById) {
+    const geoId = geoNode.props[0];
+
+    // 1. Geometry → BlendShape deformer(s)
+    const blendShapeIds = [];
+    for (const c of conns.children) {
+        if (c.name !== 'C' || c.props[0] !== 'OO') continue;
+        const [, fromId, toId] = c.props;
+        if (toId === geoId && deformerById.has(fromId)
+                && deformerById.get(fromId).props[2] === 'BlendShape') {
+            blendShapeIds.push(fromId);
+        }
+    }
+    if (blendShapeIds.length === 0) return null;
+
+    // 2. BlendShape → BlendShapeChannel(s) → Shape(s)
+    const channels = [];
+    for (const bsId of blendShapeIds) {
+        for (const c of conns.children) {
+            if (c.name !== 'C' || c.props[0] !== 'OO') continue;
+            const [, fromId, toId] = c.props;
+            if (toId !== bsId) continue;
+            if (!deformerById.has(fromId)
+                    || deformerById.get(fromId).props[2] !== 'BlendShapeChannel') continue;
+            const channelId = fromId;
+
+            // Find all Shape geometries targeting this channel; use the last one.
+            const shapes = [];
+            for (const c2 of conns.children) {
+                if (c2.name !== 'C' || c2.props[0] !== 'OO') continue;
+                const [, fromId2, toId2] = c2.props;
+                if (toId2 === channelId && geoById.has(fromId2)
+                        && geoById.get(fromId2).props[2] === 'Shape') {
+                    shapes.push(geoById.get(fromId2));
+                }
+            }
+            if (shapes.length === 0) continue;
+            const shape = shapes[shapes.length - 1];
+
+            const indexes = prop0(findNode(shape.children, 'Indexes')) ?? [];
+            const dverts  = prop0(findNode(shape.children, 'Vertices')) ?? [];
+
+            // Expand sparse per-vertex deltas into a dense vertexCount-sized array.
+            const deltas = new Float32Array(vertexCount * 3);
+            for (let i = 0; i < indexes.length; i++) {
+                const v = indexes[i];
+                if (v >= 0 && v < vertexCount) {
+                    deltas[v*3]   = dverts[i*3];
+                    deltas[v*3+1] = dverts[i*3+1];
+                    deltas[v*3+2] = dverts[i*3+2];
+                }
+            }
+            channels.push({ channelId, deltas });
+            if (channels.length >= MAX_MORPHS) break;
+        }
+        if (channels.length >= MAX_MORPHS) break;
+    }
+
+    if (channels.length === 0) return null;
+    return { channels };
+}
+
 // =====================================================================
 // Scene graph + world transform
 // =====================================================================
@@ -771,11 +907,21 @@ async function loadModel(name) {
     const meshes = [];
     let totalTriangles = 0;
     let totalBones = 0;
+    let totalMorphs = 0;
     for (const { geoNode, modelId } of meshPairs) {
         const verts = prop0(findNode(geoNode.children, 'Vertices'));
         const vertexCount = verts ? verts.length / 3 : 0;
         const skin = buildSkinForGeometry(geoNode, vertexCount, connsNode, deformerById, modelById);
-        const meshData = buildMesh(geoNode, skin);
+        const morph = buildMorphForGeometry(geoNode, vertexCount, connsNode, geoById, deformerById);
+        // Attach a per-channel animation curve (DeformPercent) if present.
+        if (morph) {
+            for (const ch of morph.channels) {
+                ch.animation = buildMorphAnimation(nodes, ch.channelId);
+                if (ch.animation) duration = Math.max(duration, ch.animation.duration);
+            }
+        }
+        const morphDeltas = morph ? morph.channels.map(ch => ch.deltas) : null;
+        const meshData = buildMesh(geoNode, skin, morphDeltas);
         if (!meshData) continue;
         const gpu = uploadMesh(meshData);
         let texture = null;
@@ -787,15 +933,17 @@ async function loadModel(name) {
             }
         }
         const baseColor = findMaterialColorForModel(modelId);
-        meshes.push({ gpu, texture, modelId, skin, baseColor });
+        meshes.push({ gpu, texture, modelId, skin, morph, baseColor });
         totalTriangles += meshData.triangleCount;
         if (skin) totalBones += skin.boneModelIds.length;
+        if (morph) totalMorphs += morph.channels.length;
     }
 
     const scale = SCALES.get(name) ?? 1;
     scene = { meshes, parentOf, modelById, baseTRSOf, animationsOf, duration, modelName: name, scale };
-    const skinNote = totalBones ? ` — bones: ${totalBones}` : '';
-    setStatus(`${name} — triangles: ${totalTriangles}${duration ? ` — anim ${duration.toFixed(2)}s` : ''}${skinNote}`);
+    const skinNote  = totalBones  ? ` — bones: ${totalBones}`   : '';
+    const morphNote = totalMorphs ? ` — morphs: ${totalMorphs}` : '';
+    setStatus(`${name} — triangles: ${totalTriangles}${duration ? ` — anim ${duration.toFixed(2)}s` : ''}${skinNote}${morphNote}`);
 }
 
 function setStatus(msg) {
@@ -908,6 +1056,32 @@ function render(timeMs) {
             if (attribs.boneIndex  >= 0) { gl.disableVertexAttribArray(attribs.boneIndex);  gl.vertexAttrib4f(attribs.boneIndex,  0, 0, 0, 0); }
             if (attribs.boneWeight >= 0) { gl.disableVertexAttribArray(attribs.boneWeight); gl.vertexAttrib4f(attribs.boneWeight, 0, 0, 0, 0); }
         }
+
+        // Morph targets: bind up to MAX_MORPHS delta-position buffers and set
+        // the matching weight components. Unused slots get a zero constant so
+        // they cleanly contribute nothing.
+        const morphChannels = mesh.morph?.channels ?? [];
+        const morphWeights = [0, 0, 0, 0];
+        for (let m = 0; m < MAX_MORPHS; m++) {
+            const loc = attribs.morph[m];
+            if (loc < 0) continue;
+            if (m < morphChannels.length) {
+                gl.bindBuffer(gl.ARRAY_BUFFER, mesh.gpu.morphBufs[m]);
+                gl.enableVertexAttribArray(loc);
+                gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0);
+                const ch = morphChannels[m];
+                const pct = ch.animation
+                    ? sampleCurve(ch.animation.curve, PARAMS.time, 0)
+                    : 0;
+                // Use animated DeformPercent (0..100) if present, else the
+                // `?morph=` URL override (0..1) for manual inspection.
+                morphWeights[m] = ch.animation ? pct / 100 : PARAMS.morph;
+            } else {
+                gl.disableVertexAttribArray(loc);
+                gl.vertexAttrib3f(loc, 0, 0, 0);
+            }
+        }
+        gl.uniform4f(uniforms.morphWeights, morphWeights[0], morphWeights[1], morphWeights[2], morphWeights[3]);
 
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.gpu.idxBuf);
         gl.drawElements(gl.TRIANGLES, mesh.gpu.count, mesh.gpu.idxType, 0);

@@ -27,8 +27,10 @@ const MODELS = [
     { name: 'gltf/Fox',                 file: 'fox',                      time: 0 },
     { name: 'test/anim_skin_bend',      file: 'anim-skin-bend-t0',        time: 0 },
     { name: 'test/anim_skin_bend',      file: 'anim-skin-bend-t1',        time: 1.0 },
-    { name: 'morph_test',               file: 'morph-test',               time: 0 },
-    { name: 'morph-translation',        file: 'morph-translation',        time: 0 },
+    { name: 'morph_test',               file: 'morph-test-w0',            time: 0, extra: '&morph=0'   },
+    { name: 'morph_test',               file: 'morph-test-w1',            time: 0, extra: '&morph=1'   },
+    { name: 'morph-translation',        file: 'morph-translation-w0',     time: 0, extra: '&morph=0'   },
+    { name: 'morph-translation',        file: 'morph-translation-w1',     time: 0, extra: '&morph=1'   },
     { name: 'stanford-bunny',           file: 'stanford-bunny',           time: 0 },
 ];
 
@@ -36,7 +38,7 @@ const MODELS = [
     const browser = await chromium.launch({ headless: true });
     try {
         for (const m of MODELS) {
-            const url = `http://127.0.0.1:5500/example/webgl1/index.html?model=${encodeURIComponent(m.name)}&animation=0&time=${m.time}`;
+            const url = `http://127.0.0.1:5500/example/webgl1/index.html?model=${encodeURIComponent(m.name)}&animation=0&time=${m.time}${m.extra ?? ''}`;
             console.log(`\n=== ${m.name} ===`);
             console.log(`  ${url}`);
             const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
