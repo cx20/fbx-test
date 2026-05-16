@@ -10,11 +10,36 @@ const { parseFBX, findNode, findNodes, prop0, FBX_TIME_UNIT_SECONDS } = window.F
 const { mat4, mat3, vec3 } = window.glMatrix;
 
 const ASSETS = [
-    { name: 'monkey',                   url: '../../assets/models/fbx/monkey.fbx' },
-    { name: 'monkey_embedded_texture',  url: '../../assets/models/fbx/monkey_embedded_texture.fbx' },
-    { name: 'vCube',                    url: '../../assets/models/fbx/vCube.fbx' },
-    { name: 'gltf/AnimatedTriangle',    url: '../../assets/models/fbx/gltf/AnimatedTriangle.fbx' },
+    'monkey',
+    'monkey_embedded_texture',
+    'vCube',
+    'archer/ArcherRi01',
+    'warrior/Warrior',
+    'stanford-bunny',
+    'mixamo',
+    'RotationTest',
+    'exampleWindow',
+    'Head_69',
+    'morph-translation',
+    'morph_test',
+    'Samba Dancing',
+    // Unit-test assets
+    'test/anim_euler_jump',
+    'test/anim_skin_bend',
+    'test/anim_root_motion',
+    // glTF sample models converted to FBX
+    'gltf/AnimatedTriangle',
+    'gltf/SimpleSkin',
+    'gltf/RiggedSimple',
+    'gltf/RiggedFigure',
+    'gltf/Fox',
 ];
+
+const FBX_BASE = '../../assets/models/fbx/';
+
+function modelUrl(name) {
+    return FBX_BASE + name.split('/').map(encodeURIComponent).join('/') + '.fbx';
+}
 
 const SEARCH_PARAMS = new URLSearchParams(window.location.search);
 
@@ -26,7 +51,7 @@ function getBoolParam(key, defaultValue) {
 
 function getInitialModel() {
     const wanted = SEARCH_PARAMS.get('model');
-    return ASSETS.some(a => a.name === wanted) ? wanted : ASSETS[0].name;
+    return ASSETS.includes(wanted) ? wanted : ASSETS[0];
 }
 
 const PARAMS = {
@@ -449,11 +474,11 @@ const cameraTarget = vec3.fromValues(0, 50, 0);
 const cameraUp     = vec3.fromValues(0, 1, 0);
 
 async function loadModel(name) {
-    const asset = ASSETS.find(a => a.name === name);
-    if (!asset) return;
+    if (!ASSETS.includes(name)) return;
     setStatus(`Loading ${name} ...`);
 
-    const buffer = await fetch(asset.url).then(r => r.arrayBuffer());
+    const url = modelUrl(name);
+    const buffer = await fetch(url).then(r => r.arrayBuffer());
     const { nodes } = await parseFBX(buffer);
 
     const objects = findNode(nodes, 'Objects');
@@ -471,7 +496,7 @@ async function loadModel(name) {
 
     let texture = null;
     if (meshData.hasUVs) {
-        try { texture = await loadTexture(nodes, asset.url); } catch (e) { console.warn('Texture load failed:', e); }
+        try { texture = await loadTexture(nodes, url); } catch (e) { console.warn('Texture load failed:', e); }
     }
 
     scene = { gpu, baseTRS, animation, texture, modelName: name };
@@ -555,7 +580,7 @@ function render(timeMs) {
 
 function initGui() {
     const gui = new lil.GUI();
-    gui.add(PARAMS, 'asset', ASSETS.map(a => a.name)).name('asset').onChange(loadModel);
+    gui.add(PARAMS, 'asset', ASSETS).name('asset').onChange(loadModel);
     gui.add(PARAMS, 'animate').name('play');
 }
 
