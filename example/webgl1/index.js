@@ -768,7 +768,12 @@ function buildMorphForGeometry(geoNode, vertexCount, conns, geoById, deformerByI
                     deltas[v*3+2] = dverts[i*3+2];
                 }
             }
-            channels.push({ channelId, deltas });
+            // Channel display name (strip FBX's "\x00\x01SubDeformer" suffix).
+            const channelNode = deformerById.get(channelId);
+            const rawName = channelNode?.props[1] ?? '';
+            const sep = rawName.indexOf('\x00');
+            const name = sep >= 0 ? rawName.slice(0, sep) : rawName;
+            channels.push({ channelId, name, deltas, weight: 0 });
             if (channels.length >= MAX_MORPHS) break;
         }
         if (channels.length >= MAX_MORPHS) break;
@@ -1035,7 +1040,11 @@ async function loadModel(name) {
             }
         }
         const baseColor = findMaterialColorForModel(modelId);
-        meshes.push({ gpu, texture, modelId, skin, morph, baseColor });
+        // Display name for the mesh (used by the per-channel morph GUI).
+        const rawModelName = modelById.get(modelId)?.props[1] ?? '';
+        const sep = rawModelName.indexOf('\x00');
+        const modelName = sep >= 0 ? rawModelName.slice(0, sep) : rawModelName;
+        meshes.push({ gpu, texture, modelId, modelName, skin, morph, baseColor });
         totalTriangles += meshData.triangleCount;
         if (skin) totalBones += skin.boneModelIds.length;
         if (morph) totalMorphs += morph.channels.length;
@@ -1057,7 +1066,7 @@ async function loadModel(name) {
     const clipNote  = sceneClips.length > 1 ? ` — clips: ${sceneClips.length}` : '';
     const dur = sceneClips[0]?.duration ?? 0;
     setStatus(`${name} — triangles: ${totalTriangles}${dur ? ` — anim ${dur.toFixed(2)}s` : ''}${skinNote}${morphNote}${clipNote}`);
-    updateMorphGui(totalMorphs > 0);
+    updateMorphGui(meshes);
     updateClipGui(sceneClips);
 }
 
@@ -1189,9 +1198,9 @@ function render(timeMs) {
                 const ch = morphChannels[m];
                 const anim = morphAnims.get(ch.channelId);
                 // Use animated DeformPercent (0..100) if the current clip
-                // animates this channel, else the `morph weight` slider /
-                // `?morph=` URL override (0..1) for manual inspection.
-                morphWeights[m] = anim ? sampleCurve(anim.curve, PARAMS.time, 0) / 100 : PARAMS.morph;
+                // animates this channel, else the per-channel slider value
+                // (settable from the GUI / initialized from `?morph=` URL).
+                morphWeights[m] = anim ? sampleCurve(anim.curve, PARAMS.time, 0) / 100 : ch.weight;
             } else {
                 gl.disableVertexAttribArray(loc);
                 gl.vertexAttrib3f(loc, 0, 0, 0);
@@ -1210,12 +1219,13 @@ function render(timeMs) {
 // GUI
 // =====================================================================
 
-let morphCtrl = null;
+let gui = null;
 let clipCtrl = null;
+let morphsFolder = null;
 const CLIP_PARAM = { clip: '' };
 
 function initGui() {
-    const gui = new lil.GUI();
+    gui = new lil.GUI();
     gui.add(PARAMS, 'asset', ASSETS).name('asset').onChange(loadModel);
     gui.add(PARAMS, 'animate').name('play');
     clipCtrl = gui.add(CLIP_PARAM, 'clip', ['']).name('clip').onChange(name => {
@@ -1227,15 +1237,30 @@ function initGui() {
         }
     });
     clipCtrl.hide();
-    morphCtrl = gui.add(PARAMS, 'morph', 0, 1, 0.01).name('morph weight');
-    morphCtrl.hide();
 }
 
-// Show the morph slider only when the loaded model has BlendShape channels.
-function updateMorphGui(hasMorphs) {
-    if (!morphCtrl) return;
-    if (hasMorphs) morphCtrl.show();
-    else morphCtrl.hide();
+// Rebuild the "Morphs" folder from the loaded scene's meshes. One subfolder
+// per mesh that has BlendShape channels, with one slider per channel — the
+// same layout the Babylon viewer uses. The folder is destroyed and rebuilt
+// each load so switching to a non-morph model leaves the panel clean.
+function updateMorphGui(meshes) {
+    if (!gui) return;
+    if (morphsFolder) {
+        morphsFolder.destroy();
+        morphsFolder = null;
+    }
+    const morphMeshes = meshes.filter(m => m.morph && m.morph.channels.length > 0);
+    if (morphMeshes.length === 0) return;
+
+    morphsFolder = gui.addFolder('Morphs');
+    for (const mesh of morphMeshes) {
+        const sub = morphsFolder.addFolder(mesh.modelName || `mesh_${mesh.modelId}`);
+        for (const ch of mesh.morph.channels) {
+            // Initialize to PARAMS.morph (lets `?morph=` URL preset all channels).
+            ch.weight = PARAMS.morph;
+            sub.add(ch, 'weight', 0, 1, 0.01).name(ch.name || 'channel');
+        }
+    }
 }
 
 // Repopulate the clip dropdown with the loaded scene's clip names. The
