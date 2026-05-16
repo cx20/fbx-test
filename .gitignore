@@ -8,3 +8,6 @@ Thumbs.db
 
 # Claude Code worktrees
 .claude/
+
+# Node
+node_modules/

@@ -18,6 +18,7 @@ const ASSETS = [
     'test/anim_root_motion',
     // glTF sample models converted to FBX
     'gltf/AnimatedTriangle',
+    'gltf/SimpleSkin',
     'gltf/RiggedSimple',
     'gltf/RiggedFigure',
     'gltf/Fox',
@@ -102,13 +103,65 @@ function getInitialClipName() {
     return SEARCH_PARAMS.get('clip') ?? null;
 }
 
+function getBoolParam(key, defaultValue) {
+    const value = SEARCH_PARAMS.get(key);
+    if (value === null) return defaultValue;
+    return !['0', 'false', 'off', 'no'].includes(value.toLowerCase());
+}
+
+let groundMesh = null;
+let gridMesh = null;
+let skeletonViewers = [];
+
 const PARAMS = {
     asset: getInitialSelection(),
     animate: getAnimationEnabled(),
     clip: '',
     time: getAnimationTime() ?? 0,
+    skeleton: getBoolParam('skeleton', false),
+    fog: getBoolParam('fog', true),
+    ground: getBoolParam('ground', true),
+    grid: getBoolParam('grid', true),
     debug: showDebugLayer,
 };
+
+function disposeSkeletonViewers() {
+    skeletonViewers.forEach(v => v.dispose());
+    skeletonViewers = [];
+}
+
+function rebuildSkeletonViewers() {
+    disposeSkeletonViewers();
+    if (!scene || !importedMeshes.length) return;
+    const seenSkeletons = new Set();
+    for (const node of importedMeshes) {
+        if (!(node instanceof BABYLON.Mesh)) continue;
+        const skeleton = node.skeleton;
+        if (!skeleton || seenSkeletons.has(skeleton)) continue;
+        seenSkeletons.add(skeleton);
+        const viewer = new BABYLON.Debug.SkeletonViewer(skeleton, node, scene, false, 3, {
+            displayMode: BABYLON.Debug.SkeletonViewer.DISPLAY_LINES,
+        });
+        viewer.color = BABYLON.Color3.Red();
+        viewer.isEnabled = PARAMS.skeleton;
+        skeletonViewers.push(viewer);
+    }
+}
+
+function setSceneVisibility() {
+    if (groundMesh) groundMesh.isVisible = PARAMS.ground;
+    if (gridMesh) gridMesh.isVisible = PARAMS.grid;
+    skeletonViewers.forEach(v => { v.isEnabled = PARAMS.skeleton; });
+    if (!scene) return;
+    if (PARAMS.fog) {
+        scene.fogMode = BABYLON.Scene.FOGMODE_LINEAR;
+        scene.fogColor = new BABYLON.Color3(0.627, 0.627, 0.627);
+        scene.fogStart = 200;
+        scene.fogEnd = 1000;
+    } else {
+        scene.fogMode = BABYLON.Scene.FOGMODE_NONE;
+    }
+}
 
 function frameModel(nodes) {
     const meshes = nodes.filter(node => node instanceof BABYLON.Mesh);
@@ -143,6 +196,7 @@ async function loadModel(selection) {
     setStatus(`読み込み中: ${name} ...`);
 
     try {
+        disposeSkeletonViewers();
         importedMeshes.forEach(m => m.dispose());
         importedMeshes = [];
         activeAnimations = [];
@@ -172,6 +226,7 @@ async function loadModel(selection) {
         PARAMS.asset = selection;
         rebuildAnimationFolder();
         rebuildMorphsFolder();
+        rebuildSkeletonViewers();
 
         const meshCount = meshes.filter(m => m instanceof BABYLON.Mesh).length;
         const msg = `${name} — meshes: ${meshCount}`;
@@ -291,6 +346,10 @@ function showDebugLayer() {
 function initGui() {
     gui = new lil.GUI();
     assetController = gui.add(PARAMS, 'asset', getAssetOptions()).name('asset');
+    gui.add(PARAMS, 'skeleton').name('skeleton').onChange(setSceneVisibility);
+    gui.add(PARAMS, 'fog').name('fog').onChange(setSceneVisibility);
+    gui.add(PARAMS, 'ground').name('ground').onChange(setSceneVisibility);
+    gui.add(PARAMS, 'grid').name('grid').onChange(setSceneVisibility);
     animationFolder = gui.addFolder('Animation').hide();
     morphsFolder = gui.addFolder('Morphs').hide();
     gui.add(PARAMS, 'debug').name('Debug');
@@ -302,10 +361,6 @@ async function init() {
 
     scene = new BABYLON.Scene(engine);
     scene.clearColor = new BABYLON.Color4(0.627, 0.627, 0.627, 1);
-    scene.fogMode = BABYLON.Scene.FOGMODE_LINEAR;
-    scene.fogColor = new BABYLON.Color3(0.627, 0.627, 0.627);
-    scene.fogStart = 200;
-    scene.fogEnd = 1000;
 
     // Match Three.js: camera at (100,200,300), target (0,100,0).
     // Babylon.js is LH so Z is negated → BJS camera at (100,200,-300).
@@ -341,15 +396,15 @@ async function init() {
     scene.imageProcessingConfiguration.toneMappingType = BABYLON.ImageProcessingConfiguration.TONEMAPPING_KHR_PBR_NEUTRAL;
     scene.imageProcessingConfiguration.exposure = 1 / 0.6 * 1.5; // ≈ 2.5: compensates for lower light intensity vs Three.js
 
-    const ground = BABYLON.MeshBuilder.CreateGround('ground', { width: 2000, height: 2000 }, scene);
+    groundMesh = BABYLON.MeshBuilder.CreateGround('ground', { width: 2000, height: 2000 }, scene);
     const groundMat = new BABYLON.StandardMaterial('groundMat', scene);
     groundMat.diffuseColor = new BABYLON.Color3(0.6, 0.6, 0.6);
     groundMat.specularColor = new BABYLON.Color3(0, 0, 0);
     groundMat.backFaceCulling = false;
     groundMat.alpha = 0.8;
     groundMat.disableDepthWrite = true;
-    ground.material = groundMat;
-    ground.receiveShadows = true;
+    groundMesh.material = groundMat;
+    groundMesh.receiveShadows = true;
 
     shadowGenerator = new BABYLON.ShadowGenerator(1024, dir);
     shadowGenerator.useBlurExponentialShadowMap = true;
@@ -365,10 +420,12 @@ async function init() {
             lines.push([new BABYLON.Vector3(-half, 0, p), new BABYLON.Vector3(half, 0, p)]);
             lines.push([new BABYLON.Vector3(p, 0, -half), new BABYLON.Vector3(p, 0, half)]);
         }
-        const grid = BABYLON.MeshBuilder.CreateLineSystem('grid', { lines }, scene);
-        grid.color = new BABYLON.Color3(0, 0, 0);
-        grid.alpha = 0.2;
+        gridMesh = BABYLON.MeshBuilder.CreateLineSystem('grid', { lines }, scene);
+        gridMesh.color = new BABYLON.Color3(0, 0, 0);
+        gridMesh.alpha = 0.2;
     })();
+
+    setSceneVisibility();
 
     const initialSelection = getInitialSelection();
     initGui();
