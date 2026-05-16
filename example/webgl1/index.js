@@ -148,8 +148,8 @@ function resize() {
 function getProps70(modelNode) {
     const p70 = findNode(modelNode.children, 'Properties70');
     const out = {
-        T: [0,0,0], R: [0,0,0], S: [1,1,1], preR: [0,0,0], rotOrder: 0,
-        geoT: [0,0,0], geoR: [0,0,0], geoS: [1,1,1],
+        T: [0, 0, 0], R: [0, 0, 0], S: [1, 1, 1], preR: [0, 0, 0], rotOrder: 0,
+        geoT: [0, 0, 0], geoR: [0, 0, 0], geoS: [1, 1, 1],
     };
     if (!p70) return out;
     for (const p of p70.children) {
