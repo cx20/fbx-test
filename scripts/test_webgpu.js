@@ -1,0 +1,81 @@
+// Smoke-test the WebGPU sample with vCube and AnimatedTriangle.
+const { chromium } = require('playwright');
+const path = require('path');
+
+const MODELS = [
+    { name: 'vCube',                    file: 'vcube',                    time: 0 },
+    { name: 'gltf/AnimatedTriangle',    file: 'animated-triangle-t0',     time: 0 },
+    { name: 'gltf/AnimatedTriangle',    file: 'animated-triangle-t05',    time: 0.5 },
+    { name: 'gltf/AnimatedTriangle',    file: 'animated-triangle-t10',    time: 1.0 },
+    { name: 'monkey',                   file: 'monkey',                   time: 0 },
+    { name: 'monkey_embedded_texture',  file: 'monkey-embedded',          time: 0 },
+    { name: 'Samba Dancing',            file: 'samba-dancing',            time: 0 },
+    { name: 'archer/ArcherRi01',        file: 'archer',                   time: 0 },
+    { name: 'warrior/Warrior',          file: 'warrior',                  time: 0 },
+    { name: 'stanford-bunny',           file: 'bunny',                    time: 0 },
+    { name: 'Head_69',                  file: 'head',                     time: 0 },
+    { name: 'RotationTest',             file: 'rotation-test',            time: 0 },
+    { name: 'exampleWindow',            file: 'example-window',           time: 0 },
+    { name: 'mixamo',                   file: 'mixamo',                   time: 0 },
+    { name: 'test/anim_euler_jump',     file: 'anim-euler-jump',          time: 0 },
+    { name: 'test/anim_root_motion',    file: 'anim-root-motion',         time: 0 },
+    { name: 'gltf/SimpleSkin',          file: 'simple-skin-t0',           time: 0 },
+    { name: 'gltf/SimpleSkin',          file: 'simple-skin-t1',           time: 1.0 },
+    { name: 'gltf/RiggedSimple',        file: 'rigged-simple-t0',         time: 0 },
+    { name: 'gltf/RiggedSimple',        file: 'rigged-simple-t1',         time: 1.0 },
+    { name: 'gltf/RiggedFigure',        file: 'rigged-figure',            time: 0 },
+    { name: 'gltf/Fox',                 file: 'fox',                      time: 0 },
+    { name: 'test/anim_skin_bend',      file: 'anim-skin-bend-t0',        time: 0 },
+    { name: 'test/anim_skin_bend',      file: 'anim-skin-bend-t1',        time: 1.0 },
+    { name: 'morph_test',               file: 'morph-test-w0',            time: 0, extra: '&morph=0'   },
+    { name: 'morph_test',               file: 'morph-test-w1',            time: 0, extra: '&morph=1'   },
+    { name: 'morph-translation',        file: 'morph-translation-w0',     time: 0, extra: '&morph=0'   },
+    { name: 'morph-translation',        file: 'morph-translation-w1',     time: 0, extra: '&morph=1'   },
+    { name: 'stanford-bunny',           file: 'stanford-bunny',           time: 0 },
+    { name: 'warrior/Warrior',          file: 'warrior-mv_tar21',         time: 0, extra: '&clip=mv_tar21' },
+    { name: 'gltf/Fox',                 file: 'fox-survey',               time: 0, extra: '&clip=Survey'   },
+];
+
+(async () => {
+    // WebGPU requires a real GPU adapter; Chromium's headless mode does not
+    // expose one. Run windowed (headless: false) with the real installed Chrome
+    // for offscreen testing — set CHROME_CHANNEL=msedge or =chrome if needed.
+    const browser = await chromium.launch({
+        headless: false,
+        channel: process.env.CHROME_CHANNEL || 'chrome',
+        args: ['--enable-unsafe-webgpu', '--enable-features=Vulkan'],
+    });
+    try {
+        for (const m of MODELS) {
+            const url = `http://127.0.0.1:5500/example/webgpu/index.html?model=${encodeURIComponent(m.name)}&animation=0&time=${m.time}${m.extra ?? ''}`;
+            console.log(`\n=== ${m.name} ===`);
+            console.log(`  ${url}`);
+            const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+            const page = await ctx.newPage();
+            const errs = [];
+            page.on('console', msg => {
+                const t = msg.text();
+                if (msg.type() === 'error' || /\b(error|exception)\b/i.test(t)) errs.push(t);
+            });
+            page.on('pageerror', err => errs.push(`pageerror: ${err.message}`));
+            try {
+                await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+                await page.waitForFunction(() => {
+                    const s = document.getElementById('status');
+                    return s && /triangles:|Error/i.test(s.textContent);
+                }, { timeout: 15000 }).catch(() => {});
+                await page.waitForTimeout(1500);
+                const status = await page.evaluate(() => document.getElementById('status').textContent);
+                console.log(`  status: ${status}`);
+                const out = path.join(__dirname, 'screenshots', `webgpu-${m.file}.png`);
+                await page.screenshot({ path: out, fullPage: false });
+                console.log(`  saved: ${out}`);
+                for (const e of errs.slice(0, 5)) console.log(`  err: ${e}`);
+            } finally {
+                await ctx.close();
+            }
+        }
+    } finally {
+        await browser.close();
+    }
+})();
