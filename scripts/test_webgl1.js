@@ -19,6 +19,10 @@ const MODELS = [
     { name: 'mixamo',                   file: 'mixamo',                   time: 0 },
     { name: 'test/anim_euler_jump',     file: 'anim-euler-jump',          time: 0 },
     { name: 'test/anim_root_motion',    file: 'anim-root-motion',         time: 0 },
+    { name: 'gltf/SimpleSkin',          file: 'simple-skin-t0',           time: 0 },
+    { name: 'gltf/SimpleSkin',          file: 'simple-skin-t1',           time: 1.0 },
+    { name: 'gltf/RiggedSimple',        file: 'rigged-simple-t0',         time: 0 },
+    { name: 'gltf/RiggedSimple',        file: 'rigged-simple-t1',         time: 1.0 },
 ];
 
 (async () => {

@@ -13,20 +13,38 @@ attribute vec3 aPosition;
 attribute vec3 aNormal;
 attribute vec4 aColor;
 attribute vec2 aTexCoord;
+attribute vec4 aBoneIndex;
+attribute vec4 aBoneWeight;
 
 uniform mat4 uViewProj;
 uniform mat4 uModel;
 uniform mat3 uNormalMat;
+uniform bool uSkinned;
+uniform mat4 uBones[64];
 
 varying vec3 vNormal;
 varying vec4 vColor;
 varying vec2 vTexCoord;
 
 void main() {
-    vNormal = normalize(uNormalMat * aNormal);
+    vec4 pos;
+    vec3 nrm;
+    if (uSkinned) {
+        mat4 skin =
+            aBoneWeight.x * uBones[int(aBoneIndex.x)] +
+            aBoneWeight.y * uBones[int(aBoneIndex.y)] +
+            aBoneWeight.z * uBones[int(aBoneIndex.z)] +
+            aBoneWeight.w * uBones[int(aBoneIndex.w)];
+        pos = skin * vec4(aPosition, 1.0);
+        nrm = mat3(skin) * aNormal;
+    } else {
+        pos = uModel * vec4(aPosition, 1.0);
+        nrm = uNormalMat * aNormal;
+    }
+    vNormal = normalize(nrm);
     vColor = aColor;
     vTexCoord = aTexCoord;
-    gl_Position = uViewProj * uModel * vec4(aPosition, 1.0);
+    gl_Position = uViewProj * pos;
 }
 </script>
 

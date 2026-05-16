@@ -36,6 +36,7 @@ const ASSETS = [
 ];
 
 const FBX_BASE = '../../assets/models/fbx/';
+const MAX_BONES = 64; // must match uBones[] in vertex shader
 
 const SCALES = new Map([
     ['warrior/Warrior',    100],
@@ -108,10 +109,12 @@ function initGL() {
         document.getElementById('fs').textContent,
     );
     attribs = {
-        position: gl.getAttribLocation(program, 'aPosition'),
-        normal:   gl.getAttribLocation(program, 'aNormal'),
-        color:    gl.getAttribLocation(program, 'aColor'),
-        texCoord: gl.getAttribLocation(program, 'aTexCoord'),
+        position:   gl.getAttribLocation(program, 'aPosition'),
+        normal:     gl.getAttribLocation(program, 'aNormal'),
+        color:      gl.getAttribLocation(program, 'aColor'),
+        texCoord:   gl.getAttribLocation(program, 'aTexCoord'),
+        boneIndex:  gl.getAttribLocation(program, 'aBoneIndex'),
+        boneWeight: gl.getAttribLocation(program, 'aBoneWeight'),
     };
     uniforms = {
         viewProj:        gl.getUniformLocation(program, 'uViewProj'),
@@ -123,6 +126,8 @@ function initGL() {
         hasVertexColor:  gl.getUniformLocation(program, 'uHasVertexColor'),
         hasTexture:      gl.getUniformLocation(program, 'uHasTexture'),
         texture:         gl.getUniformLocation(program, 'uTexture'),
+        skinned:         gl.getUniformLocation(program, 'uSkinned'),
+        bones:           gl.getUniformLocation(program, 'uBones'),
     };
 
     gl.clearColor(0.627, 0.627, 0.627, 1.0);
@@ -208,7 +213,10 @@ function makeLocalMatrix(T, preR, R, S) {
 // We expand each polygon corner into its own vertex (one vertex per FBX
 // polygon-vertex) so per-corner normals can vary across adjacent faces,
 // and emit a fan triangulation per polygon.
-function buildMesh(geoNode) {
+//
+// If `skinPerVertex` is provided ({ boneIndices, boneWeights }), per-vertex
+// skinning attributes (4 bones per vertex) are expanded alongside positions.
+function buildMesh(geoNode, skinPerVertex) {
     const verts = prop0(findNode(geoNode.children, 'Vertices'));
     const polyIdxNode = findNode(geoNode.children, 'PolygonVertexIndex');
     if (!verts || !polyIdxNode) return null;
@@ -254,6 +262,8 @@ function buildMesh(geoNode) {
     const outNormals   = [];
     const outColors    = [];
     const outUVs       = [];
+    const outBoneIdx   = [];
+    const outBoneWt    = [];
     const outIndices   = [];
     let polyCornerStart = 0;
     let polyId = 0;
@@ -270,6 +280,12 @@ function buildMesh(geoNode) {
         outColors.push(c[0], c[1], c[2], c[3]);
         const uv = lookup(uvsData, 2, i, polyId, v, [0, 0]);
         outUVs.push(uv[0], 1.0 - uv[1]); // FBX UV V=0 is top; WebGL V=0 is bottom
+        if (skinPerVertex) {
+            const bi = skinPerVertex.boneIndices;
+            const bw = skinPerVertex.boneWeights;
+            outBoneIdx.push(bi[v*4], bi[v*4+1], bi[v*4+2], bi[v*4+3]);
+            outBoneWt.push (bw[v*4], bw[v*4+1], bw[v*4+2], bw[v*4+3]);
+        }
 
         if (isEnd) {
             for (let j = polyCornerStart + 1; j < i; j++) {
@@ -285,10 +301,13 @@ function buildMesh(geoNode) {
         normals:   new Float32Array(outNormals),
         colors:    new Float32Array(outColors),
         uvs:       new Float32Array(outUVs),
+        boneIndices: skinPerVertex ? new Float32Array(outBoneIdx) : null,
+        boneWeights: skinPerVertex ? new Float32Array(outBoneWt)  : null,
         indices:   outIndices,               // plain number[] — typed in uploadMesh
         triangleCount: outIndices.length / 3,
         hasVertexColor: !!colorsData,
         hasUVs: !!uvsData,
+        hasSkin: !!skinPerVertex,
     };
 }
 
@@ -309,6 +328,16 @@ function uploadMesh(meshData) {
     gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
     gl.bufferData(gl.ARRAY_BUFFER, meshData.uvs, gl.STATIC_DRAW);
 
+    let boneIdxBuf = null, boneWtBuf = null;
+    if (meshData.hasSkin) {
+        boneIdxBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, boneIdxBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, meshData.boneIndices, gl.STATIC_DRAW);
+        boneWtBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, boneWtBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, meshData.boneWeights, gl.STATIC_DRAW);
+    }
+
     // Use Uint32 indices for meshes with more than 65535 expanded vertices
     const needU32 = meshData.positions.length / 3 > 65535;
     const idxData = needU32 ? new Uint32Array(meshData.indices) : new Uint16Array(meshData.indices);
@@ -319,10 +348,11 @@ function uploadMesh(meshData) {
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idxData, gl.STATIC_DRAW);
 
     return {
-        posBuf, normBuf, colorBuf, uvBuf, idxBuf, idxType,
+        posBuf, normBuf, colorBuf, uvBuf, boneIdxBuf, boneWtBuf, idxBuf, idxType,
         count: meshData.indices.length,
         hasVertexColor: meshData.hasVertexColor,
         hasUVs: meshData.hasUVs,
+        hasSkin: meshData.hasSkin,
     };
 }
 
@@ -476,6 +506,111 @@ async function loadTextureFromVideo(vid, assetUrl) {
 }
 
 // =====================================================================
+// Skinning
+// =====================================================================
+
+// Gather skinning info for a Geometry node, if it has a Skin Deformer.
+// Returns:
+//   { boneModelIds: Int[],           // ordered list of bone Model IDs
+//     bindInverses: mat4[],          // per-bone: cluster.Transform (mesh-local → bone-local at bind)
+//     boneIndices: Float32Array,     // per-vertex (vertexCount * 4)
+//     boneWeights: Float32Array }    // per-vertex (vertexCount * 4)
+// or null if not skinned. Bones are dropped silently beyond MAX_BONES.
+//
+// Skinning math: per FBX spec, `Transform = inverse(TransformLink) * meshWorldAtBind`
+// maps a mesh-local vertex to its bind-pose position in the bone's local frame.
+// So `skinMatrix = boneCurrentWorld * Transform` gives the world-space deformed
+// position directly — no separate mesh world matrix is needed.
+function buildSkinForGeometry(geoNode, vertexCount, conns, deformerById, modelById) {
+    const geoId = geoNode.props[0];
+
+    // 1. Geometry → Skin deformer (OO)
+    let skinId = null;
+    for (const c of conns.children) {
+        if (c.name !== 'C' || c.props[0] !== 'OO') continue;
+        const [, fromId, toId] = c.props;
+        if (toId === geoId && deformerById.has(fromId)
+                && deformerById.get(fromId).props[2] === 'Skin') {
+            skinId = fromId; break;
+        }
+    }
+    if (skinId === null) return null;
+
+    // 2. Skin → Cluster (Deformer "Cluster" subDeformers)
+    const clusters = [];
+    for (const c of conns.children) {
+        if (c.name !== 'C' || c.props[0] !== 'OO') continue;
+        const [, fromId, toId] = c.props;
+        if (toId === skinId && deformerById.has(fromId)
+                && deformerById.get(fromId).props[2] === 'Cluster') {
+            clusters.push(deformerById.get(fromId));
+        }
+    }
+    if (clusters.length === 0) return null;
+
+    // 3. For each cluster, find its bone LimbNode + extract bind matrix.
+    const boneModelIds = [];
+    const bindInverses = [];
+    const perCluster = []; // { boneIndex, indexes, weights }
+    for (const cluster of clusters) {
+        const clusterId = cluster.props[0];
+        let boneModelId = null;
+        for (const c of conns.children) {
+            if (c.name !== 'C' || c.props[0] !== 'OO') continue;
+            const [, fromId, toId] = c.props;
+            if (toId === clusterId && modelById.has(fromId)) { boneModelId = fromId; break; }
+        }
+        if (boneModelId === null) continue;
+
+        const transform = prop0(findNode(cluster.children, 'Transform'));
+        if (!transform || transform.length !== 16) continue;
+        const bindInv = mat4.fromValues(...transform);
+
+        const indexes = prop0(findNode(cluster.children, 'Indexes')) ?? [];
+        const weights = prop0(findNode(cluster.children, 'Weights')) ?? [];
+
+        const boneIndex = boneModelIds.length;
+        if (boneIndex >= MAX_BONES) {
+            console.warn(`Skipping bone ${boneModelId}: exceeds MAX_BONES (${MAX_BONES})`);
+            continue;
+        }
+        boneModelIds.push(boneModelId);
+        bindInverses.push(bindInv);
+        perCluster.push({ boneIndex, indexes, weights });
+    }
+    if (boneModelIds.length === 0) return null;
+
+    // 4. Per-vertex influences (top-4 by weight, normalized).
+    const influences = Array.from({ length: vertexCount }, () => []);
+    for (const ci of perCluster) {
+        for (let k = 0; k < ci.indexes.length; k++) {
+            const v = ci.indexes[k];
+            const w = ci.weights[k];
+            if (v >= 0 && v < vertexCount && w > 0) {
+                influences[v].push({ idx: ci.boneIndex, w });
+            }
+        }
+    }
+    const boneIndices = new Float32Array(vertexCount * 4);
+    const boneWeights = new Float32Array(vertexCount * 4);
+    for (let v = 0; v < vertexCount; v++) {
+        const inf = influences[v];
+        inf.sort((a, b) => b.w - a.w);
+        const top = inf.slice(0, 4);
+        let total = 0;
+        for (const e of top) total += e.w;
+        if (total > 0) {
+            for (let i = 0; i < top.length; i++) {
+                boneIndices[v * 4 + i] = top[i].idx;
+                boneWeights[v * 4 + i] = top[i].w / total;
+            }
+        }
+    }
+
+    return { boneModelIds, bindInverses, boneIndices, boneWeights };
+}
+
+// =====================================================================
 // Scene graph + world transform
 // =====================================================================
 
@@ -554,15 +689,21 @@ async function loadModel(name) {
     const matById   = new Map(findNodes(objects.children, 'Material').map(n => [n.props[0], n]));
     const texById   = new Map(findNodes(objects.children, 'Texture').map(n => [n.props[0], n]));
     const vidById   = new Map(findNodes(objects.children, 'Video').map(n => [n.props[0], n]));
+    const deformerById = new Map(findNodes(objects.children, 'Deformer').map(n => [n.props[0], n]));
 
     // Build connection maps
-    const parentOf   = new Map();           // OO childId → parentId (for model hierarchy)
-    const reverseConns = new Map();         // toId → [{fromId}] (for texture lookup)
+    const parentOf   = new Map();           // OO childModelId → parentModelId (scene graph)
+    const reverseConns = new Map();         // toId → [fromId] (for texture/skin lookup)
     for (const c of connsNode.children) {
         if (c.name !== 'C') continue;
         const fromId = c.props[1];
         const toId   = c.props[2];
-        if (c.props[0] === 'OO' && modelById.has(fromId)) parentOf.set(fromId, toId);
+        // Only Model→Model OO connections form the scene-graph parent chain.
+        // (A LimbNode also has OO connections to its Cluster sub-deformer; those
+        // would clobber the real parent if we set parentOf indiscriminately.)
+        if (c.props[0] === 'OO' && modelById.has(fromId) && modelById.has(toId)) {
+            parentOf.set(fromId, toId);
+        }
         if (!reverseConns.has(toId)) reverseConns.set(toId, []);
         reverseConns.get(toId).push(fromId);
     }
@@ -605,11 +746,36 @@ async function loadModel(name) {
         return null;
     }
 
+    // Read DiffuseColor (× DiffuseFactor) from the first Material attached to a Model.
+    function findMaterialColorForModel(modelId) {
+        for (const matId of reverseConns.get(modelId) ?? []) {
+            if (!matById.has(matId)) continue;
+            const p70 = findNode(matById.get(matId).children, 'Properties70');
+            if (!p70) continue;
+            let diffuse = null, factor = 1;
+            for (const p of p70.children) {
+                if (p.name !== 'P' || !p.props) continue;
+                const k = p.props[0];
+                if ((k === 'DiffuseColor' || k === 'Diffuse') && p.props.length > 6) {
+                    diffuse = [p.props[4], p.props[5], p.props[6]];
+                } else if (k === 'DiffuseFactor' && p.props.length > 4) {
+                    factor = p.props[4];
+                }
+            }
+            if (diffuse) return [diffuse[0] * factor, diffuse[1] * factor, diffuse[2] * factor];
+        }
+        return null;
+    }
+
     // Build GPU objects for each mesh
     const meshes = [];
     let totalTriangles = 0;
+    let totalBones = 0;
     for (const { geoNode, modelId } of meshPairs) {
-        const meshData = buildMesh(geoNode);
+        const verts = prop0(findNode(geoNode.children, 'Vertices'));
+        const vertexCount = verts ? verts.length / 3 : 0;
+        const skin = buildSkinForGeometry(geoNode, vertexCount, connsNode, deformerById, modelById);
+        const meshData = buildMesh(geoNode, skin);
         if (!meshData) continue;
         const gpu = uploadMesh(meshData);
         let texture = null;
@@ -620,13 +786,16 @@ async function loadModel(name) {
                 catch (e) { console.warn('Texture load failed:', e); }
             }
         }
-        meshes.push({ gpu, texture, modelId });
+        const baseColor = findMaterialColorForModel(modelId);
+        meshes.push({ gpu, texture, modelId, skin, baseColor });
         totalTriangles += meshData.triangleCount;
+        if (skin) totalBones += skin.boneModelIds.length;
     }
 
     const scale = SCALES.get(name) ?? 1;
     scene = { meshes, parentOf, modelById, baseTRSOf, animationsOf, duration, modelName: name, scale };
-    setStatus(`${name} — triangles: ${totalTriangles}${duration ? ` — anim ${duration.toFixed(2)}s` : ''}`);
+    const skinNote = totalBones ? ` — bones: ${totalBones}` : '';
+    setStatus(`${name} — triangles: ${totalTriangles}${duration ? ` — anim ${duration.toFixed(2)}s` : ''}${skinNote}`);
 }
 
 function setStatus(msg) {
@@ -657,16 +826,22 @@ function render(timeMs) {
 
     gl.useProgram(program);
     gl.uniformMatrix4fv(uniforms.viewProj, false, viewProj);
-    gl.uniform4f(uniforms.baseColor, 0.85, 0.85, 0.9, 1.0);
     gl.uniform3f(uniforms.lightDir, 0.3, 1.0, 0.5);
     gl.uniform1f(uniforms.ambient, 0.25);
     gl.uniform1i(uniforms.texture, 0);
 
     for (const mesh of scene.meshes) {
-        const model = getWorldMatrix(mesh.modelId, PARAMS.time, scene);
-        if (scene.scale !== 1) {
-            const s = scene.scale;
-            mat4.multiply(model, mat4.fromScaling(mat4.create(), [s, s, s]), model);
+        const isSkinned = !!mesh.skin;
+
+        // Non-skinned: world matrix from mesh's own node hierarchy + scale.
+        // Skinned:     bind matrices baked into bone palette, so uModel is identity.
+        const model = mat4.create();
+        if (!isSkinned) {
+            mat4.copy(model, getWorldMatrix(mesh.modelId, PARAMS.time, scene));
+            if (scene.scale !== 1) {
+                const s = scene.scale;
+                mat4.multiply(model, mat4.fromScaling(mat4.create(), [s, s, s]), model);
+            }
         }
         const normalMat = mat3.create();
         mat3.normalFromMat4(normalMat, model);
@@ -676,6 +851,32 @@ function render(timeMs) {
         gl.uniformMatrix3fv(uniforms.normalMat, false, normalMat);
         gl.uniform1i(uniforms.hasVertexColor, mesh.gpu.hasVertexColor ? 1 : 0);
         gl.uniform1i(uniforms.hasTexture, hasTexture ? 1 : 0);
+        gl.uniform1i(uniforms.skinned, isSkinned ? 1 : 0);
+        const bc = mesh.baseColor;
+        gl.uniform4f(uniforms.baseColor,
+            bc ? bc[0] : 0.85,
+            bc ? bc[1] : 0.85,
+            bc ? bc[2] : 0.9,
+            1.0);
+
+        if (isSkinned) {
+            const bones = new Float32Array(MAX_BONES * 16);
+            const scaleM = scene.scale !== 1
+                ? mat4.fromScaling(mat4.create(), [scene.scale, scene.scale, scene.scale])
+                : null;
+            for (let i = 0; i < mesh.skin.boneModelIds.length; i++) {
+                const boneWorld = getWorldMatrix(mesh.skin.boneModelIds[i], PARAMS.time, scene);
+                const skinMat = mat4.create();
+                mat4.multiply(skinMat, boneWorld, mesh.skin.bindInverses[i]);
+                if (scaleM) mat4.multiply(skinMat, scaleM, skinMat);
+                bones.set(skinMat, i * 16);
+            }
+            // Fill remaining slots with identity so unused indices don't blow up.
+            for (let i = mesh.skin.boneModelIds.length; i < MAX_BONES; i++) {
+                bones.set(mat4.create(), i * 16);
+            }
+            gl.uniformMatrix4fv(uniforms.bones, false, bones);
+        }
 
         if (hasTexture) {
             gl.activeTexture(gl.TEXTURE0);
@@ -697,6 +898,18 @@ function render(timeMs) {
         gl.bindBuffer(gl.ARRAY_BUFFER, mesh.gpu.uvBuf);
         gl.enableVertexAttribArray(attribs.texCoord);
         gl.vertexAttribPointer(attribs.texCoord, 2, gl.FLOAT, false, 0, 0);
+
+        if (isSkinned && attribs.boneIndex >= 0 && attribs.boneWeight >= 0) {
+            gl.bindBuffer(gl.ARRAY_BUFFER, mesh.gpu.boneIdxBuf);
+            gl.enableVertexAttribArray(attribs.boneIndex);
+            gl.vertexAttribPointer(attribs.boneIndex, 4, gl.FLOAT, false, 0, 0);
+            gl.bindBuffer(gl.ARRAY_BUFFER, mesh.gpu.boneWtBuf);
+            gl.enableVertexAttribArray(attribs.boneWeight);
+            gl.vertexAttribPointer(attribs.boneWeight, 4, gl.FLOAT, false, 0, 0);
+        } else {
+            if (attribs.boneIndex  >= 0) { gl.disableVertexAttribArray(attribs.boneIndex);  gl.vertexAttrib4f(attribs.boneIndex,  0, 0, 0, 0); }
+            if (attribs.boneWeight >= 0) { gl.disableVertexAttribArray(attribs.boneWeight); gl.vertexAttrib4f(attribs.boneWeight, 0, 0, 0, 0); }
+        }
 
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.gpu.idxBuf);
         gl.drawElements(gl.TRIANGLES, mesh.gpu.count, mesh.gpu.idxType, 0);
