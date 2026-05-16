@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebGL 2.0 + FBX Example</title>
+  <link rel="stylesheet" type="text/css" href="style.css">
+  <script src="https://unpkg.com/gl-matrix@3.4.4/gl-matrix-min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.20/dist/lil-gui.umd.min.js"></script>
+</head>
+<body>
+
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+in vec3 aPosition;
+in vec3 aNormal;
+in vec4 aColor;
+in vec2 aTexCoord;
+in vec4 aBoneIndex;
+in vec4 aBoneWeight;
+in vec3 aMorph0;
+in vec3 aMorph1;
+in vec3 aMorph2;
+in vec3 aMorph3;
+
+uniform mat4 uViewProj;
+uniform mat4 uModel;
+uniform mat3 uNormalMat;
+uniform bool uSkinned;
+uniform mat4 uBones[64];
+uniform vec4 uMorphWeights;
+
+out vec3 vNormal;
+out vec4 vColor;
+out vec2 vTexCoord;
+
+void main() {
+    vec3 morphed = aPosition
+        + aMorph0 * uMorphWeights.x
+        + aMorph1 * uMorphWeights.y
+        + aMorph2 * uMorphWeights.z
+        + aMorph3 * uMorphWeights.w;
+    vec4 pos;
+    vec3 nrm;
+    if (uSkinned) {
+        mat4 skin =
+            aBoneWeight.x * uBones[int(aBoneIndex.x)] +
+            aBoneWeight.y * uBones[int(aBoneIndex.y)] +
+            aBoneWeight.z * uBones[int(aBoneIndex.z)] +
+            aBoneWeight.w * uBones[int(aBoneIndex.w)];
+        pos = skin * vec4(morphed, 1.0);
+        nrm = mat3(skin) * aNormal;
+    } else {
+        pos = uModel * vec4(morphed, 1.0);
+        nrm = uNormalMat * aNormal;
+    }
+    vNormal = normalize(nrm);
+    vColor = aColor;
+    vTexCoord = aTexCoord;
+    gl_Position = uViewProj * pos;
+}
+</script>
+
+<script id="fs" type="x-shader/x-fragment">#version 300 es
+precision mediump float;
+
+uniform vec4 uBaseColor;
+uniform vec3 uLightDir;
+uniform float uAmbient;
+uniform bool uHasVertexColor;
+uniform bool uHasTexture;
+uniform sampler2D uTexture;
+
+in vec3 vNormal;
+in vec4 vColor;
+in vec2 vTexCoord;
+
+out vec4 fragColor;
+
+void main() {
+    vec3 N = normalize(vNormal);
+    float diffuse = max(dot(N, normalize(uLightDir)), 0.0);
+    float shade = uAmbient + (1.0 - uAmbient) * diffuse;
+    vec4 base;
+    if (uHasTexture) {
+        base = texture(uTexture, vTexCoord);
+    } else if (uHasVertexColor) {
+        base = vColor;
+    } else {
+        base = uBaseColor;
+    }
+    fragColor = vec4(base.rgb * shade, base.a);
+}
+</script>
+
+<div id="status"></div>
+<canvas id="c"></canvas>
+
+<script src="fbx-parser.js"></script>
+<script src="index.js"></script>
+</body>
+</html>
