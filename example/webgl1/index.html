@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebGL 1.0 + FBX Example</title>
+  <link rel="stylesheet" type="text/css" href="style.css">
+  <script src="https://unpkg.com/gl-matrix@3.4.4/gl-matrix-min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.20/dist/lil-gui.umd.min.js"></script>
+</head>
+<body>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec3 aPosition;
+attribute vec3 aNormal;
+attribute vec4 aColor;
+
+uniform mat4 uViewProj;
+uniform mat4 uModel;
+uniform mat3 uNormalMat;
+
+varying vec3 vNormal;
+varying vec4 vColor;
+
+void main() {
+    vNormal = normalize(uNormalMat * aNormal);
+    vColor = aColor;
+    gl_Position = uViewProj * uModel * vec4(aPosition, 1.0);
+}
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+precision mediump float;
+
+uniform vec4 uBaseColor;
+uniform vec3 uLightDir;
+uniform float uAmbient;
+uniform bool uHasVertexColor;
+
+varying vec3 vNormal;
+varying vec4 vColor;
+
+void main() {
+    vec3 N = normalize(vNormal);
+    float diffuse = max(dot(N, normalize(uLightDir)), 0.0);
+    float shade = uAmbient + (1.0 - uAmbient) * diffuse;
+    vec4 base = uHasVertexColor ? vColor : uBaseColor;
+    gl_FragColor = vec4(base.rgb * shade, base.a);
+}
+</script>
+
+<div id="status"></div>
+<canvas id="c"></canvas>
+
+<script src="fbx-parser.js"></script>
+<script src="index.js"></script>
+</body>
+</html>
