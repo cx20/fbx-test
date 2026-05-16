@@ -12,6 +12,7 @@
 attribute vec3 aPosition;
 attribute vec3 aNormal;
 attribute vec4 aColor;
+attribute vec2 aTexCoord;
 
 uniform mat4 uViewProj;
 uniform mat4 uModel;
@@ -19,10 +20,12 @@ uniform mat3 uNormalMat;
 
 varying vec3 vNormal;
 varying vec4 vColor;
+varying vec2 vTexCoord;
 
 void main() {
     vNormal = normalize(uNormalMat * aNormal);
     vColor = aColor;
+    vTexCoord = aTexCoord;
     gl_Position = uViewProj * uModel * vec4(aPosition, 1.0);
 }
 </script>
@@ -34,15 +37,25 @@ uniform vec4 uBaseColor;
 uniform vec3 uLightDir;
 uniform float uAmbient;
 uniform bool uHasVertexColor;
+uniform bool uHasTexture;
+uniform sampler2D uTexture;
 
 varying vec3 vNormal;
 varying vec4 vColor;
+varying vec2 vTexCoord;
 
 void main() {
     vec3 N = normalize(vNormal);
     float diffuse = max(dot(N, normalize(uLightDir)), 0.0);
     float shade = uAmbient + (1.0 - uAmbient) * diffuse;
-    vec4 base = uHasVertexColor ? vColor : uBaseColor;
+    vec4 base;
+    if (uHasTexture) {
+        base = texture2D(uTexture, vTexCoord);
+    } else if (uHasVertexColor) {
+        base = vColor;
+    } else {
+        base = uBaseColor;
+    }
     gl_FragColor = vec4(base.rgb * shade, base.a);
 }
 </script>
