@@ -92,7 +92,9 @@ rotational offset for each bone.
 |---|----------|--------|
 | 1 | Synthetic root bone with `Z_UP × Armature` local matrix | Mesh blows up to 100× scale or twists 90°, because `mesh.world` already includes `Z_UP` — adding it to the bone chain double-counts it |
 | 2 | `inv_bind = ancestor.multiplyToRef(invTL, result)` (i.e. `invTL × ancestorMatrix` in BJS standard product, which strips `Z_UP` from `invTL`) | SimpleSkin keeps working, but RiggedFigure shoulder is unchanged — the math reduces to the master state in a different decomposition |
-| 3 | (Not tried) `mesh.setPoseMatrix(...)` + `skeleton.needInitialSkinMatrix = true` to route through BJS's per-mesh skin-matrix path | Hypothetical — may give us a place to inject the `Z_UP` correction without double-counting |
+| 3 | Write the legacy override to `bone._absoluteInverseBindMatrix` (the newer field name) in addition to `bone._invertedAbsoluteTransform` | First sign of life: with `bone._absoluteInverseBindMatrix = cluster.Transform` (= `inv(TL_bind) × meshWorldAtBind`, the algebraically-correct inverse bind when mesh.world equals the bone-ancestor-chain world), RiggedFigure renders the A-pose correctly. **But** `warrior/Warrior` regresses — the mesh tips onto its back and distorts. See "Why this regresses warrior" below. |
+| 4 | Same as #3 but with the older `inv(TransformLink)` value mirrored to both fields | RiggedFigure collapses into a vertical line (mesh squashes to the origin); warrior also distorts. Confirms that the *value* matters and #3's `cluster.Transform` is the right matrix for RiggedFigure — but the override breaks any mesh whose `mesh.world` is *not* equal to its bone-ancestor-chain world at bind time |
+| 5 | (Not tried) `mesh.setPoseMatrix(...)` + `skeleton.needInitialSkinMatrix = true` to route through BJS's per-mesh skin-matrix path | Hypothetical — may give us a place to inject the `Z_UP` correction without double-counting |
 
 The fundamental issue is that with `mesh.world ≠ identity`, no **constant**
 `inv_bind` matrix can make the BJS formula `mesh.world × abs × inv_bind`
@@ -100,28 +102,71 @@ algebraically equal to the Three.js formula `delta × mesh.world` (the
 `Z_UP`-cancelling term would have to depend on `chain_t`, which varies per
 frame).
 
+**The current BJS dev build uses `_absoluteInverseBindMatrix`, not the legacy
+`_invertedAbsoluteTransform`.** Setting only the legacy field is a silent
+no-op on the GPU skinning path, which means master's "override" never took
+effect on this build — BJS's auto-computed inverse-bind (from the
+Properties70-derived hierarchy at construction time) is what's actually being
+rendered. That happens to work for `warrior` and visually for `SimpleSkin`,
+but produces the shoulder ROM divergence for `RiggedFigure`.
+
+**Why approach #3 regresses warrior.**
+
+The cluster.Transform fix relies on a hidden assumption: `mesh.world` (BJS)
+equals the **FBX bone ancestor chain's world at bind time** (= `Armature.world`
+in this loader). When that holds, the BJS formula
+`mesh.world × abs(t) × cluster.Transform × v` collapses to the FBX skinning
+formula `TL(t) × inv(TL_bind) × meshWorldAtBind × v` per bone.
+
+For RiggedFigure / SimpleSkin the assumption holds, because the mesh node sits
+under the scene root (or under a static `__root__` `TransformNode`), so
+`mesh.world` is **static** and equals `Z_UP × Armature` (= the bone ancestor).
+
+For `warrior/Warrior` the assumption breaks. From the FBX scene graph:
+
+```
+  '100800_kl_npc_mo_0' (Mesh)  →  '100800_kl_npc_mo' (LimbNode bone)
+```
+
+The mesh is parented **to a bone**, not to the scene root. In the BJS loader
+this becomes `mesh.parent = the bone's linked TransformNode`, so
+`mesh.world(t) = boneTN.world(t) × mesh.local` — and that changes every frame
+as the animation drives the parent bone. The static `cluster.Transform` value
+can't compensate for a dynamic `mesh.world`, and the rendered mesh ends up
+distorted (lying on its back at idle t=0).
+
 **Promising directions for a real fix.**
 
-1. **Use the BJS per-mesh skin-matrix path.** Set `skeleton.needInitialSkinMatrix = true`
-   and pass `mesh.getPoseMatrix()` such that the bone chain's effective `abs_t`
-   contributes the `Z_UP` factor *inside* the GPU matrix (instead of outside via
-   `mesh.world`). This is the most "BJS-idiomatic" fix.
+1. **Per-mesh bind path selection.** Detect at load time whether the skinned
+   mesh's parent is a bone `TransformNode` or a static node. For the static
+   case, write `cluster.Transform` into `_absoluteInverseBindMatrix` (fixes
+   RiggedFigure / SimpleSkin). For the bone-parented case, leave the bind
+   alone (or set it to whatever currently makes warrior work). The signal is
+   straightforward — `nodeToParent.get(meshModelId)` exists, and we already
+   know which model IDs are LimbNodes when we build the skeleton.
 
-2. **Re-parent the mesh.** Put the `Z_UP × Armature` transform on a parent
-   `TransformNode` so that the mesh node itself can carry identity. Then add a
-   synthetic root bone with the same transform, and the bone chain naturally
-   matches the FBX `TransformLink` space. The mesh's `world` would then equal
-   the synthetic root bone's absolute, and the math collapses cleanly.
-   Watch out for double-application bugs when `mesh.parent` and the synthetic
-   bone both pick up the same scene-graph transform.
+2. **Detach the mesh from its bone parent.** For bone-parented meshes, replace
+   the parent with a static `TransformNode` (or `__root__`) and bake the
+   bone's bind-time world matrix into the mesh's local transform. After this
+   `mesh.world` is static and the unified `cluster.Transform` override
+   applies. Bone-driven motion still reaches the vertices via skinning
+   weights, so the visual stays correct. Watch out for non-skinned meshes
+   that *should* follow their bone parent (those should be left alone).
 
-3. **Bake `Z_UP` into the vertex data at load time.** Transform every vertex by
-   `Z_UP` and zero out the mesh's local transform. Simplest math, but loses the
-   distinction between mesh transform and geometry — may surprise users who
-   expect `mesh.position` etc. to behave like an FBX hierarchy node.
+3. **Use the BJS per-mesh skin-matrix path.** Set
+   `skeleton.needInitialSkinMatrix = true` and pass `mesh.getPoseMatrix()`
+   such that the bone chain's effective `abs(t)` contributes the missing
+   factor *inside* the GPU matrix instead of outside via `mesh.world`. Most
+   "BJS-idiomatic" route; requires deeper BJS internals knowledge.
 
-Of these, (1) is least invasive but requires deeper BJS internals knowledge;
-(2) is most architecturally clean.
+4. **Bake `Z_UP` into the vertex data at load time.** Transform every vertex
+   by `Z_UP` and zero out the mesh's local transform. Simplest math, but
+   loses the distinction between mesh transform and geometry — may surprise
+   users who expect `mesh.position` etc. to behave like an FBX hierarchy
+   node.
+
+Of these, (1) is least invasive and most targeted; (2) is the architecturally
+cleanest unified fix.
 
 ---
 
@@ -187,11 +232,15 @@ currently untracked under `scripts/`):
   which when applied to a vector in child-local space first transforms by
   `child_local` (→ parent-local) then by `parent_abs` (→ world). ✓
 - The BJS build used by this repo
-  (`https://cx20.github.io/gltf-test/libs/babylonjs/dev/babylon.js`) still
-  recognises **`bone._invertedAbsoluteTransform`** as the inverse-bind field
-  name; the newer field name is `_absoluteInverseBindMatrix`. SimpleSkin
-  renders close to Three.js with `_invertedAbsoluteTransform` set, so for the
-  current dev build it is **not** a no-op.
+  (`https://cx20.github.io/gltf-test/libs/babylonjs/dev/babylon.js`) keeps
+  the legacy `bone._invertedAbsoluteTransform` field for backwards-compat,
+  but the **GPU skinning path now reads `bone._absoluteInverseBindMatrix`**
+  (the newer field) when computing per-bone matrices. Writing only the
+  legacy name is a silent no-op on the GPU — the loader's existing
+  "override" is effectively unused. To actually move the inverse bind
+  pose, write to **both** fields (or just the new one). Confirmed by
+  swapping override values: changes only land visually when
+  `_absoluteInverseBindMatrix` is written.
 
 ### FBX skinning math reference
 
