@@ -37,6 +37,14 @@ const ASSETS = [
 
 const FBX_BASE = '../../assets/models/fbx/';
 
+const SCALES = new Map([
+    ['warrior/Warrior',    100],
+    ['archer/ArcherRi01',  100],
+    ['stanford-bunny',     0.001],
+    ['Head_69',            100],
+    ['gltf/Fox',           0.01],
+]);
+
 function modelUrl(name) {
     return FBX_BASE + name.split('/').map(encodeURIComponent).join('/') + '.fbx';
 }
@@ -121,6 +129,7 @@ function initGL() {
     gl.enable(gl.DEPTH_TEST);
     gl.enable(gl.CULL_FACE);
     gl.cullFace(gl.BACK);
+    gl.getExtension('OES_element_index_uint'); // allow Uint32 indices for large meshes
 }
 
 function resize() {
@@ -138,16 +147,23 @@ function resize() {
 
 function getProps70(modelNode) {
     const p70 = findNode(modelNode.children, 'Properties70');
-    const out = { T: [0, 0, 0], R: [0, 0, 0], S: [1, 1, 1], preR: [0, 0, 0], rotOrder: 0 };
+    const out = {
+        T: [0,0,0], R: [0,0,0], S: [1,1,1], preR: [0,0,0], rotOrder: 0,
+        geoT: [0,0,0], geoR: [0,0,0], geoS: [1,1,1],
+    };
     if (!p70) return out;
     for (const p of p70.children) {
         if (p.name !== 'P' || !p.props) continue;
         const k = p.props[0];
-        if (k === 'Lcl Translation' && p.props.length > 6) out.T    = [p.props[4], p.props[5], p.props[6]];
-        else if (k === 'Lcl Rotation'    && p.props.length > 6) out.R    = [p.props[4], p.props[5], p.props[6]];
-        else if (k === 'Lcl Scaling'     && p.props.length > 6) out.S    = [p.props[4], p.props[5], p.props[6]];
-        else if (k === 'PreRotation'     && p.props.length > 6) out.preR = [p.props[4], p.props[5], p.props[6]];
-        else if (k === 'RotationOrder'   && p.props.length > 4) out.rotOrder = p.props[4];
+        const v3 = p.props.length > 6 ? [p.props[4], p.props[5], p.props[6]] : null;
+        if      (k === 'Lcl Translation'      && v3) out.T    = v3;
+        else if (k === 'Lcl Rotation'         && v3) out.R    = v3;
+        else if (k === 'Lcl Scaling'          && v3) out.S    = v3;
+        else if (k === 'PreRotation'          && v3) out.preR = v3;
+        else if (k === 'GeometricTranslation' && v3) out.geoT = v3;
+        else if (k === 'GeometricRotation'    && v3) out.geoR = v3;
+        else if (k === 'GeometricScaling'     && v3) out.geoS = v3;
+        else if (k === 'RotationOrder' && p.props.length > 4) out.rotOrder = p.props[4];
     }
     return out;
 }
@@ -165,12 +181,18 @@ function eulerToMat4(out, deg) {
     return out;
 }
 
-function makeModelMatrix(T, R, S) {
+// Local matrix: T * preR * R * S
+function makeLocalMatrix(T, preR, R, S) {
     const m = mat4.create();
     mat4.translate(m, m, T);
-    const rotM = mat4.create();
-    eulerToMat4(rotM, R);
-    mat4.multiply(m, m, rotM);
+    if (preR && (preR[0] || preR[1] || preR[2])) {
+        const pm = mat4.create();
+        eulerToMat4(pm, preR);
+        mat4.multiply(m, m, pm);
+    }
+    const rm = mat4.create();
+    eulerToMat4(rm, R);
+    mat4.multiply(m, m, rm);
     mat4.scale(m, m, S);
     return m;
 }
@@ -247,7 +269,7 @@ function buildMesh(geoNode) {
         const c = lookup(colorsData, 4, i, polyId, v, [1, 1, 1, 1]);
         outColors.push(c[0], c[1], c[2], c[3]);
         const uv = lookup(uvsData, 2, i, polyId, v, [0, 0]);
-        outUVs.push(uv[0], uv[1]);
+        outUVs.push(uv[0], 1.0 - uv[1]); // FBX UV V=0 is top; WebGL V=0 is bottom
 
         if (isEnd) {
             for (let j = polyCornerStart + 1; j < i; j++) {
@@ -263,7 +285,7 @@ function buildMesh(geoNode) {
         normals:   new Float32Array(outNormals),
         colors:    new Float32Array(outColors),
         uvs:       new Float32Array(outUVs),
-        indices:   new Uint16Array(outIndices),
+        indices:   outIndices,               // plain number[] — typed in uploadMesh
         triangleCount: outIndices.length / 3,
         hasVertexColor: !!colorsData,
         hasUVs: !!uvsData,
@@ -287,12 +309,17 @@ function uploadMesh(meshData) {
     gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
     gl.bufferData(gl.ARRAY_BUFFER, meshData.uvs, gl.STATIC_DRAW);
 
+    // Use Uint32 indices for meshes with more than 65535 expanded vertices
+    const needU32 = meshData.positions.length / 3 > 65535;
+    const idxData = needU32 ? new Uint32Array(meshData.indices) : new Uint16Array(meshData.indices);
+    const idxType = needU32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+
     const idxBuf = gl.createBuffer();
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, meshData.indices, gl.STATIC_DRAW);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idxData, gl.STATIC_DRAW);
 
     return {
-        posBuf, normBuf, colorBuf, uvBuf, idxBuf,
+        posBuf, normBuf, colorBuf, uvBuf, idxBuf, idxType,
         count: meshData.indices.length,
         hasVertexColor: meshData.hasVertexColor,
         hasUVs: meshData.hasUVs,
@@ -434,38 +461,74 @@ function loadTextureFromBytes(bytes) {
     return loadTextureFromUrl(url).finally(() => URL.revokeObjectURL(url));
 }
 
-// Find a texture in FBX: returns { type:'embedded', content:ArrayBuffer }
-// or { type:'external', url:string }, or null.
-function extractTextureInfo(nodes, assetUrl) {
-    const objects = findNode(nodes, 'Objects');
-    if (!objects) return null;
-    const baseUrl = assetUrl.substring(0, assetUrl.lastIndexOf('/') + 1);
-    for (const vid of findNodes(objects.children, 'Video')) {
-        const contentNode = findNode(vid.children, 'Content');
-        if (contentNode && contentNode.props[0] instanceof ArrayBuffer) {
-            return { type: 'embedded', content: contentNode.props[0] };
-        }
-        const relNode = findNode(vid.children, 'RelativeFilename');
-        if (relNode && relNode.props[0]) {
-            const rel = relNode.props[0].replace(/\\/g, '/');
-            return { type: 'external', url: baseUrl + rel };
-        }
+// Load a WebGL texture from a Video FBX node (embedded bytes or relative file path).
+async function loadTextureFromVideo(vid, assetUrl) {
+    const contentNode = findNode(vid.children, 'Content');
+    if (contentNode && contentNode.props[0] instanceof ArrayBuffer) {
+        return loadTextureFromBytes(contentNode.props[0]);
+    }
+    const relNode = findNode(vid.children, 'RelativeFilename');
+    if (relNode && relNode.props[0]) {
+        const base = assetUrl.substring(0, assetUrl.lastIndexOf('/') + 1);
+        return loadTextureFromUrl(base + relNode.props[0].replace(/\\/g, '/'));
     }
     return null;
 }
 
-async function loadTexture(nodes, assetUrl) {
-    const info = extractTextureInfo(nodes, assetUrl);
-    if (!info) return null;
-    if (info.type === 'embedded') return loadTextureFromBytes(info.content);
-    return loadTextureFromUrl(info.url);
+// =====================================================================
+// Scene graph + world transform
+// =====================================================================
+
+// Compute the world matrix for a mesh node by walking up its parent chain,
+// accumulating local transforms (with animations) and then appending the
+// leaf node's geometric transform (GeometricTranslation/Rotation/Scaling).
+function getWorldMatrix(leafModelId, time, scene) {
+    const { parentOf, modelById, baseTRSOf, animationsOf } = scene;
+
+    // Collect ancestor chain from root down to leafModelId
+    const chain = [];
+    let id = leafModelId;
+    const seen = new Set();
+    while (id !== undefined && !seen.has(id)) {
+        seen.add(id);
+        if (modelById.has(id)) chain.unshift(id);
+        id = parentOf.get(id);
+    }
+
+    // Accumulate local transforms root → leaf
+    const world = mat4.create();
+    for (const nodeId of chain) {
+        const base = baseTRSOf.get(nodeId);
+        const trs  = sampleAnimation(animationsOf.get(nodeId) ?? null, time, base);
+        mat4.multiply(world, world, makeLocalMatrix(trs.T, base.preR, trs.R, trs.S));
+    }
+
+    // Apply geometric transform (fixed offset in local space, not animated)
+    const base = baseTRSOf.get(leafModelId);
+    if (base) {
+        const { geoT, geoR, geoS } = base;
+        const hasGeo = geoT.some(v => v !== 0) || geoR.some(v => v !== 0) || geoS.some(v => v !== 1);
+        if (hasGeo) mat4.multiply(world, world, makeLocalMatrix(geoT, null, geoR, geoS));
+    }
+
+    return world;
 }
 
 // =====================================================================
 // Scene state
 // =====================================================================
 
-let scene = null; // { gpu, baseTRS, animation }
+// scene = {
+//   meshes:      [{ gpu, texture, modelId }],
+//   parentOf:    Map<childId, parentId>,
+//   modelById:   Map<id, modelNode>,
+//   baseTRSOf:   Map<id, TRS>,
+//   animationsOf:Map<id, animation>,
+//   duration:    number,
+//   modelName:   string,
+// }
+let scene = null;
+
 const projection = mat4.create();
 const view       = mat4.create();
 const viewProj   = mat4.create();
@@ -481,26 +544,89 @@ async function loadModel(name) {
     const buffer = await fetch(url).then(r => r.arrayBuffer());
     const { nodes } = await parseFBX(buffer);
 
-    const objects = findNode(nodes, 'Objects');
-    const geoNode = findNode(objects.children, 'Geometry');
-    const meshModel = findNodes(objects.children, 'Model').find(m => m.props[2] === 'Mesh');
-    if (!geoNode || !meshModel) {
-        setStatus(`Error: no Geometry or Mesh model in ${name}`);
-        return;
+    const objects   = findNode(nodes, 'Objects');
+    const connsNode = findNode(nodes, 'Connections');
+    if (!objects || !connsNode) { setStatus(`Error: missing Objects/Connections in ${name}`); return; }
+
+    // Build object maps by ID
+    const geoById = new Map(findNodes(objects.children, 'Geometry').map(n => [n.props[0], n]));
+    const modelById = new Map(findNodes(objects.children, 'Model').map(n => [n.props[0], n]));
+    const matById   = new Map(findNodes(objects.children, 'Material').map(n => [n.props[0], n]));
+    const texById   = new Map(findNodes(objects.children, 'Texture').map(n => [n.props[0], n]));
+    const vidById   = new Map(findNodes(objects.children, 'Video').map(n => [n.props[0], n]));
+
+    // Build connection maps
+    const parentOf   = new Map();           // OO childId → parentId (for model hierarchy)
+    const reverseConns = new Map();         // toId → [{fromId}] (for texture lookup)
+    for (const c of connsNode.children) {
+        if (c.name !== 'C') continue;
+        const fromId = c.props[1];
+        const toId   = c.props[2];
+        if (c.props[0] === 'OO' && modelById.has(fromId)) parentOf.set(fromId, toId);
+        if (!reverseConns.has(toId)) reverseConns.set(toId, []);
+        reverseConns.get(toId).push(fromId);
     }
 
-    const meshData = buildMesh(geoNode);
-    const gpu = uploadMesh(meshData);
-    const baseTRS = getProps70(meshModel);
-    const animation = buildAnimation(nodes, meshModel.props[0]);
+    // Find all Geometry→Model pairs
+    const meshPairs = [];
+    for (const c of connsNode.children) {
+        if (c.name !== 'C' || c.props[0] !== 'OO') continue;
+        const [, fromId, toId] = c.props;
+        if (geoById.has(fromId) && modelById.has(toId)) {
+            meshPairs.push({ geoNode: geoById.get(fromId), modelId: toId });
+        }
+    }
+    if (meshPairs.length === 0) { setStatus(`Error: no Geometry in ${name}`); return; }
 
-    let texture = null;
-    if (meshData.hasUVs) {
-        try { texture = await loadTexture(nodes, url); } catch (e) { console.warn('Texture load failed:', e); }
+    // Per-model base TRS (including geometric transforms)
+    const baseTRSOf = new Map();
+    for (const [id, m] of modelById) baseTRSOf.set(id, getProps70(m));
+
+    // Per-model animations
+    const animationsOf = new Map();
+    for (const [id] of modelById) {
+        const anim = buildAnimation(nodes, id);
+        if (anim) animationsOf.set(id, anim);
+    }
+    let duration = 0;
+    for (const a of animationsOf.values()) duration = Math.max(duration, a.duration);
+
+    // Trace Model→Material→Texture→Video to find the Video node for a mesh
+    function findVideoForModel(modelId) {
+        for (const matId of reverseConns.get(modelId) ?? []) {
+            if (!matById.has(matId)) continue;
+            for (const texId of reverseConns.get(matId) ?? []) {
+                if (!texById.has(texId)) continue;
+                for (const vidId of reverseConns.get(texId) ?? []) {
+                    if (vidById.has(vidId)) return vidById.get(vidId);
+                }
+            }
+        }
+        return null;
     }
 
-    scene = { gpu, baseTRS, animation, texture, modelName: name };
-    setStatus(`${name} — triangles: ${meshData.triangleCount}${animation ? ` — anim ${animation.duration.toFixed(2)}s` : ''}`);
+    // Build GPU objects for each mesh
+    const meshes = [];
+    let totalTriangles = 0;
+    for (const { geoNode, modelId } of meshPairs) {
+        const meshData = buildMesh(geoNode);
+        if (!meshData) continue;
+        const gpu = uploadMesh(meshData);
+        let texture = null;
+        if (meshData.hasUVs) {
+            const vid = findVideoForModel(modelId);
+            if (vid) {
+                try { texture = await loadTextureFromVideo(vid, url); }
+                catch (e) { console.warn('Texture load failed:', e); }
+            }
+        }
+        meshes.push({ gpu, texture, modelId });
+        totalTriangles += meshData.triangleCount;
+    }
+
+    const scale = SCALES.get(name) ?? 1;
+    scene = { meshes, parentOf, modelById, baseTRSOf, animationsOf, duration, modelName: name, scale };
+    setStatus(`${name} — triangles: ${totalTriangles}${duration ? ` — anim ${duration.toFixed(2)}s` : ''}`);
 }
 
 function setStatus(msg) {
@@ -512,14 +638,14 @@ function setStatus(msg) {
 // =====================================================================
 
 function render(timeMs) {
-    if (PARAMS.animate && scene?.animation) {
-        PARAMS.time = (timeMs / 1000) % scene.animation.duration;
+    if (PARAMS.animate && scene?.duration) {
+        PARAMS.time = (timeMs / 1000) % scene.duration;
     }
 
     resize();
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-    if (!scene) {
+    if (!scene || scene.meshes.length === 0) {
         requestAnimationFrame(render);
         return;
     }
@@ -529,47 +655,52 @@ function render(timeMs) {
     mat4.lookAt(view, cameraEye, cameraTarget, cameraUp);
     mat4.multiply(viewProj, projection, view);
 
-    const trs = sampleAnimation(scene.animation, PARAMS.time, scene.baseTRS);
-    const model = makeModelMatrix(trs.T, trs.R, trs.S);
-    const normalMat = mat3.create();
-    mat3.normalFromMat4(normalMat, model);
-
-    const hasTexture = !!(scene.texture && scene.gpu.hasUVs);
-
     gl.useProgram(program);
     gl.uniformMatrix4fv(uniforms.viewProj, false, viewProj);
-    gl.uniformMatrix4fv(uniforms.model,    false, model);
-    gl.uniformMatrix3fv(uniforms.normalMat, false, normalMat);
     gl.uniform4f(uniforms.baseColor, 0.85, 0.85, 0.9, 1.0);
     gl.uniform3f(uniforms.lightDir, 0.3, 1.0, 0.5);
     gl.uniform1f(uniforms.ambient, 0.25);
-    gl.uniform1i(uniforms.hasVertexColor, scene.gpu.hasVertexColor ? 1 : 0);
-    gl.uniform1i(uniforms.hasTexture, hasTexture ? 1 : 0);
     gl.uniform1i(uniforms.texture, 0);
 
-    if (hasTexture) {
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, scene.texture);
+    for (const mesh of scene.meshes) {
+        const model = getWorldMatrix(mesh.modelId, PARAMS.time, scene);
+        if (scene.scale !== 1) {
+            const s = scene.scale;
+            mat4.multiply(model, mat4.fromScaling(mat4.create(), [s, s, s]), model);
+        }
+        const normalMat = mat3.create();
+        mat3.normalFromMat4(normalMat, model);
+        const hasTexture = !!(mesh.texture && mesh.gpu.hasUVs);
+
+        gl.uniformMatrix4fv(uniforms.model,    false, model);
+        gl.uniformMatrix3fv(uniforms.normalMat, false, normalMat);
+        gl.uniform1i(uniforms.hasVertexColor, mesh.gpu.hasVertexColor ? 1 : 0);
+        gl.uniform1i(uniforms.hasTexture, hasTexture ? 1 : 0);
+
+        if (hasTexture) {
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, mesh.texture);
+        }
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, mesh.gpu.posBuf);
+        gl.enableVertexAttribArray(attribs.position);
+        gl.vertexAttribPointer(attribs.position, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, mesh.gpu.normBuf);
+        gl.enableVertexAttribArray(attribs.normal);
+        gl.vertexAttribPointer(attribs.normal, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, mesh.gpu.colorBuf);
+        gl.enableVertexAttribArray(attribs.color);
+        gl.vertexAttribPointer(attribs.color, 4, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, mesh.gpu.uvBuf);
+        gl.enableVertexAttribArray(attribs.texCoord);
+        gl.vertexAttribPointer(attribs.texCoord, 2, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.gpu.idxBuf);
+        gl.drawElements(gl.TRIANGLES, mesh.gpu.count, mesh.gpu.idxType, 0);
     }
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, scene.gpu.posBuf);
-    gl.enableVertexAttribArray(attribs.position);
-    gl.vertexAttribPointer(attribs.position, 3, gl.FLOAT, false, 0, 0);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, scene.gpu.normBuf);
-    gl.enableVertexAttribArray(attribs.normal);
-    gl.vertexAttribPointer(attribs.normal, 3, gl.FLOAT, false, 0, 0);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, scene.gpu.colorBuf);
-    gl.enableVertexAttribArray(attribs.color);
-    gl.vertexAttribPointer(attribs.color, 4, gl.FLOAT, false, 0, 0);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, scene.gpu.uvBuf);
-    gl.enableVertexAttribArray(attribs.texCoord);
-    gl.vertexAttribPointer(attribs.texCoord, 2, gl.FLOAT, false, 0, 0);
-
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, scene.gpu.idxBuf);
-    gl.drawElements(gl.TRIANGLES, scene.gpu.count, gl.UNSIGNED_SHORT, 0);
 
     requestAnimationFrame(render);
 }
