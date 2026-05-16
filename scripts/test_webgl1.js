@@ -23,6 +23,12 @@ const MODELS = [
     { name: 'gltf/SimpleSkin',          file: 'simple-skin-t1',           time: 1.0 },
     { name: 'gltf/RiggedSimple',        file: 'rigged-simple-t0',         time: 0 },
     { name: 'gltf/RiggedSimple',        file: 'rigged-simple-t1',         time: 1.0 },
+    { name: 'gltf/RiggedFigure',        file: 'rigged-figure',            time: 0 },
+    { name: 'gltf/Fox',                 file: 'fox',                      time: 0 },
+    { name: 'test/anim_skin_bend',      file: 'anim-skin-bend-t0',        time: 0 },
+    { name: 'test/anim_skin_bend',      file: 'anim-skin-bend-t1',        time: 1.0 },
+    { name: 'morph_test',               file: 'morph-test',               time: 0 },
+    { name: 'morph-translation',        file: 'morph-translation',        time: 0 },
 ];
 
 (async () => {
