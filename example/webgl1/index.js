@@ -10,6 +10,8 @@ const { parseFBX, findNode, findNodes, prop0, FBX_TIME_UNIT_SECONDS } = window.F
 const { mat4, mat3, vec3 } = window.glMatrix;
 
 const ASSETS = [
+    'Samba Dancing',
+    'morph_test',
     'monkey',
     'monkey_embedded_texture',
     'vCube',
@@ -21,8 +23,6 @@ const ASSETS = [
     'exampleWindow',
     'Head_69',
     'morph-translation',
-    'morph_test',
-    'Samba Dancing',
     // Unit-test assets
     'test/anim_euler_jump',
     'test/anim_skin_bend',
