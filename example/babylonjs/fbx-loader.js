@@ -544,11 +544,11 @@ function makeBabylonLocalMatrix(modelNode) {
     return makeBabylonLocalMatrixFromTransform(getModelTransform(modelNode));
 }
 
-// Convert FBX TransformLink (16 float64, column-major, RH) to BABYLON.Matrix (row-major, LH).
+// Convert FBX cluster matrices (16 float64, column-major, RH) to BABYLON.Matrix (row-major, LH).
 // Reading FBX column-major as BJS row-major is a transpose, which converts column-vector
 // convention to row-vector convention (same transformation, different notation). Then negate
 // elements where exactly one of (row==2, col==2) is true for RH→LH (Z-axis negation).
-function fbxTransformLinkToBabylon(tl) {
+function fbxClusterMatrixToBabylon(tl) {
     const m = new Float32Array(16);
     for (let i = 0; i < 16; i++) m[i] = tl[i];
     m[2]  = -m[2];
@@ -559,6 +559,8 @@ function fbxTransformLinkToBabylon(tl) {
     m[14] = -m[14];
     return BABYLON.Matrix.FromArray(m);
 }
+
+const fbxTransformLinkToBabylon = fbxClusterMatrixToBabylon;
 
 function getAnimationAxis(prop) {
     if (!prop) return -1;
@@ -840,6 +842,29 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
         return rawName.split('\0')[0].replace(/Model$/, '') || fallback;
     }
 
+    function isBoneLikeModelId(modelId) {
+        const type = allModelById.get(modelId)?.props[2];
+        return type === 'LimbNode' || type === 'Root';
+    }
+
+    function getSkinMeshModelIds(skinId) {
+        const result = [];
+        for (const [geoId, sid] of geoToSkin) {
+            if (sid !== skinId) continue;
+            const modelId = geoToModel.get(geoId);
+            if (modelId !== undefined) result.push(modelId);
+        }
+        return result;
+    }
+
+    function shouldUseClusterInverseBind(skinId) {
+        for (const modelId of getSkinMeshModelIds(skinId)) {
+            const modelNode = modelById.get(modelId);
+            if (modelNode && hasNonIdentityGeometryTransform(getModelTransform(modelNode))) return false;
+        }
+        return true;
+    }
+
     function orderBoneModelIds(boneModelIds) {
         const boneModelSet = new Set(boneModelIds);
         const childrenByBoneId = new Map();
@@ -878,6 +903,12 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
         return `${nameHint}_skeleton`;
     }
 
+    function setBoneInverseBindMatrix(bone, matrix) {
+        const invBind = matrix.clone ? matrix.clone() : BABYLON.Matrix.FromArray(matrix.m);
+        bone._invertedAbsoluteTransform = invBind;
+        bone._absoluteInverseBindMatrix = invBind.clone ? invBind.clone() : BABYLON.Matrix.FromArray(invBind.m);
+    }
+
     const sharedSkeletonByBoneKey = new Map();
 
     function createSkeletonForSkin(skinId, nameHint) {
@@ -893,6 +924,7 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
         }
 
         if (!boneModelIds.length) return null;
+        const useClusterInverseBind = shouldUseClusterInverseBind(skinId);
 
         // Add bridge bones: LimbNode ancestors that have no vertex weights themselves
         // but sit between two skinned bones (e.g. clavicles between Neck and UpperArm).
@@ -947,7 +979,7 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
         }
 
         const { orderedBoneIds, rootBoneIds, boneModelSet } = orderBoneModelIds(boneModelIds);
-        const boneKey = orderedBoneIds.join('|');
+        const boneKey = `${skinId}:${orderedBoneIds.join('|')}`;
         let shared = sharedSkeletonByBoneKey.get(boneKey);
         if (!shared) {
             const skeletonName = getSkeletonName(orderedBoneIds, rootBoneIds, nameHint);
@@ -961,19 +993,25 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
                 const parentBone = boneByModelId.get(nodeToParent.get(boneModelId)) ?? null;
                 const bone = new BABYLON.Bone(boneName, skeleton, parentBone, makeBabylonLocalMatrix(boneModelNode));
 
-                // Override the hierarchy-computed inverse bind pose with the FBX TransformLink matrix.
-                // TransformLink is the bone's world transform at bind time; its inverse is the exact
-                // bind-pose offset used by the FBX skinning formula. Without this, the hierarchy
-                // approximation diverges (especially for biped roots with pre-rotations), causing
-                // vertices to fly apart when animated.
+                // FBX Cluster.Transform is already the mesh-local → bone-bind-space matrix
+                // (roughly inverse(TransformLink) * meshWorldAtBind). Babylon's current GPU
+                // path reads _absoluteInverseBindMatrix; older builds used
+                // _invertedAbsoluteTransform, so keep both fields in sync.
                 const clusterId = clusterByBoneModelId.get(boneModelId);
                 if (clusterId !== undefined) {
                     const clusterNode = clusterById.get(clusterId);
-                    const tlData = prop0(findNode(clusterNode.children, 'TransformLink'));
-                    if (Array.isArray(tlData) && tlData.length === 16) {
-                        const invTL = new BABYLON.Matrix();
-                        fbxTransformLinkToBabylon(tlData).invertToRef(invTL);
-                        bone._invertedAbsoluteTransform = invTL;
+                    const transformData = useClusterInverseBind
+                        ? prop0(findNode(clusterNode.children, 'Transform'))
+                        : null;
+                    if (Array.isArray(transformData) && transformData.length === 16) {
+                        setBoneInverseBindMatrix(bone, fbxClusterMatrixToBabylon(transformData));
+                    } else {
+                        const tlData = prop0(findNode(clusterNode.children, 'TransformLink'));
+                        if (Array.isArray(tlData) && tlData.length === 16) {
+                            const invTL = new BABYLON.Matrix();
+                            fbxTransformLinkToBabylon(tlData).invertToRef(invTL);
+                            bone._invertedAbsoluteTransform = invTL;
+                        }
                     }
                 }
 
@@ -988,6 +1026,7 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
                 orderedBoneIds,
                 rootBoneIds,
                 boneModelSet,
+                useClusterInverseBind,
             };
             sharedSkeletonByBoneKey.set(boneKey, shared);
         }
@@ -1363,6 +1402,7 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
     const createdMeshes   = [];
     const skinInfoBySkinId = new Map();
     const syntheticRootNodes = [];
+    const skinInfoByMeshModelId = new Map();
     const morphChannelsByMesh = []; // [{ mesh, channels: [{ channelId, name, target }] }]
 
     // Build a Babylon.js MorphTargetManager from FBX BlendShape deformers.
@@ -1532,6 +1572,7 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
         }
         if (skinInfo?.skeleton) {
             mesh.skeleton = skinInfo.skeleton;
+            if (modelId !== undefined) skinInfoByMeshModelId.set(modelId, skinInfo);
             console.log(`[FBX] ${meshName} skin bones=${skinInfo.skeleton.bones.length}`);
         }
 
@@ -1642,6 +1683,8 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
     // Pass 3: wire parent-child relationships
     for (const [nodeId, bjsNode] of bjsNodeById) {
         const parentId = nodeToParent.get(nodeId);
+        const meshSkinInfo = skinInfoByMeshModelId.get(nodeId);
+        if (meshSkinInfo?.useClusterInverseBind && isBoneLikeModelId(parentId)) continue;
         if (parentId && parentId !== 0) {
             const parentBjsNode = bjsNodeById.get(parentId);
             if (parentBjsNode) bjsNode.parent = parentBjsNode;

@@ -7,9 +7,18 @@ For end-user API/usage, see the [top-level README](../../README.md).
 
 ---
 
-## Known issues
+## Resolved investigations
 
 ### 1. Shoulder ROM (range of motion) mismatch on `gltf/RiggedFigure`
+
+**Status.** Fixed in `fbx-loader.js`: the loader now writes FBX
+`Cluster.Transform` into Babylon's current `_absoluteInverseBindMatrix` field
+(and the legacy `_invertedAbsoluteTransform` field) for skins whose geometric
+transforms are not already baked into vertices. For those skins, meshes parented
+directly under animated bone `TransformNode`s are also detached from that bone
+parent. This keeps Babylon's outer `mesh.world` transform from double-applying
+bone motion while preserving the FBX bind-pose correction needed by
+`RiggedFigure`.
 
 **Symptom.** With the `Armature|Anim_0.002` clip at non-zero animation times,
 the arms in the Babylon.js viewer stay nearly horizontal (T-pose-like), whereas
@@ -45,11 +54,11 @@ The small per-bone deltas accumulate along the chain. For simple models like
 `gltf/SimpleSkin` the discrepancy is barely visible; for `gltf/RiggedFigure`,
 the long arm lever amplifies it into the observed shoulder ROM mismatch.
 
-`fbx-loader.js` already sets [`bone._invertedAbsoluteTransform = invTL`](fbx-loader.js)
-(line ~976) to override the auto-computed inv-bind with the FBX `TransformLink`.
-The issue is **not** that this override is a no-op — empirically, SimpleSkin
-matches Three.js closely with the override in place. The deeper problem is
-described next.
+An older revision of `fbx-loader.js` wrote only
+`bone._invertedAbsoluteTransform = inv(TransformLink)`. That matched older
+Babylon.js builds, but the current dev build's GPU path reads
+`_absoluteInverseBindMatrix`, so the intended override no longer reached the
+shader. The deeper bind-space problem is described next.
 
 **Why the obvious fixes don't work.**
 
@@ -80,13 +89,13 @@ the `Z_UP` ancestor factor) — i.e. the bone-chain coordinate space, not the FB
 world space.
 
 But `invTL = inv(Z_UP × chain_bind) = inv(chain_bind) × inv(Z_UP)`. So the
-current code's `inv_bind = invTL` is **off by `inv(Z_UP)`** in the right-side
+old `inv_bind = invTL` approach is **off by `inv(Z_UP)`** in the right-side
 position. The visible result happens to be close to correct because
 `mesh.world × inv(Z_UP)` partially cancels — but only in the rotation block;
 the bind-pose mismatch (`Properties70 ≠ TL_bind`) leaks through as a constant
 rotational offset for each bone.
 
-**Approaches tried (none successful).**
+**Approaches tried during the investigation.**
 
 | # | Approach | Result |
 |---|----------|--------|
@@ -94,7 +103,7 @@ rotational offset for each bone.
 | 2 | `inv_bind = ancestor.multiplyToRef(invTL, result)` (i.e. `invTL × ancestorMatrix` in BJS standard product, which strips `Z_UP` from `invTL`) | SimpleSkin keeps working, but RiggedFigure shoulder is unchanged — the math reduces to the master state in a different decomposition |
 | 3 | Write the legacy override to `bone._absoluteInverseBindMatrix` (the newer field name) in addition to `bone._invertedAbsoluteTransform` | First sign of life: with `bone._absoluteInverseBindMatrix = cluster.Transform` (= `inv(TL_bind) × meshWorldAtBind`, the algebraically-correct inverse bind when mesh.world equals the bone-ancestor-chain world), RiggedFigure renders the A-pose correctly. **But** `warrior/Warrior` regresses — the mesh tips onto its back and distorts. See "Why this regresses warrior" below. |
 | 4 | Same as #3 but with the older `inv(TransformLink)` value mirrored to both fields | RiggedFigure collapses into a vertical line (mesh squashes to the origin); warrior also distorts. Confirms that the *value* matters and #3's `cluster.Transform` is the right matrix for RiggedFigure — but the override breaks any mesh whose `mesh.world` is *not* equal to its bone-ancestor-chain world at bind time |
-| 5 | (Not tried) `mesh.setPoseMatrix(...)` + `skeleton.needInitialSkinMatrix = true` to route through BJS's per-mesh skin-matrix path | Hypothetical — may give us a place to inject the `Z_UP` correction without double-counting |
+| 5 | Keep the mesh's own local transform, write `cluster.Transform` to both Babylon inverse-bind fields, and skip parenting skinned meshes under animated bone transform nodes | Current fix. RiggedFigure gets the correct bind pose, and Warrior avoids dynamic `mesh.world(t)` double-counting. |
 
 The fundamental issue is that with `mesh.world ≠ identity`, no **constant**
 `inv_bind` matrix can make the BJS formula `mesh.world × abs × inv_bind`
@@ -102,13 +111,13 @@ algebraically equal to the Three.js formula `delta × mesh.world` (the
 `Z_UP`-cancelling term would have to depend on `chain_t`, which varies per
 frame).
 
-**The current BJS dev build uses `_absoluteInverseBindMatrix`, not the legacy
+**The BJS dev build used by this repo uses `_absoluteInverseBindMatrix`, not the legacy
 `_invertedAbsoluteTransform`.** Setting only the legacy field is a silent
-no-op on the GPU skinning path, which means master's "override" never took
+no-op on the GPU skinning path, which meant the older override never took
 effect on this build — BJS's auto-computed inverse-bind (from the
 Properties70-derived hierarchy at construction time) is what's actually being
-rendered. That happens to work for `warrior` and visually for `SimpleSkin`,
-but produces the shoulder ROM divergence for `RiggedFigure`.
+rendered. That happened to work visually for `SimpleSkin`, but produced the
+shoulder ROM divergence for `RiggedFigure`.
 
 **Why approach #3 regresses warrior.**
 
@@ -135,38 +144,13 @@ as the animation drives the parent bone. The static `cluster.Transform` value
 can't compensate for a dynamic `mesh.world`, and the rendered mesh ends up
 distorted (lying on its back at idle t=0).
 
-**Promising directions for a real fix.**
+**Implemented direction.**
 
-1. **Per-mesh bind path selection.** Detect at load time whether the skinned
-   mesh's parent is a bone `TransformNode` or a static node. For the static
-   case, write `cluster.Transform` into `_absoluteInverseBindMatrix` (fixes
-   RiggedFigure / SimpleSkin). For the bone-parented case, leave the bind
-   alone (or set it to whatever currently makes warrior work). The signal is
-   straightforward — `nodeToParent.get(meshModelId)` exists, and we already
-   know which model IDs are LimbNodes when we build the skeleton.
-
-2. **Detach the mesh from its bone parent.** For bone-parented meshes, replace
-   the parent with a static `TransformNode` (or `__root__`) and bake the
-   bone's bind-time world matrix into the mesh's local transform. After this
-   `mesh.world` is static and the unified `cluster.Transform` override
-   applies. Bone-driven motion still reaches the vertices via skinning
-   weights, so the visual stays correct. Watch out for non-skinned meshes
-   that *should* follow their bone parent (those should be left alone).
-
-3. **Use the BJS per-mesh skin-matrix path.** Set
-   `skeleton.needInitialSkinMatrix = true` and pass `mesh.getPoseMatrix()`
-   such that the bone chain's effective `abs(t)` contributes the missing
-   factor *inside* the GPU matrix instead of outside via `mesh.world`. Most
-   "BJS-idiomatic" route; requires deeper BJS internals knowledge.
-
-4. **Bake `Z_UP` into the vertex data at load time.** Transform every vertex
-   by `Z_UP` and zero out the mesh's local transform. Simplest math, but
-   loses the distinction between mesh transform and geometry — may surprise
-   users who expect `mesh.position` etc. to behave like an FBX hierarchy
-   node.
-
-Of these, (1) is least invasive and most targeted; (2) is the architecturally
-cleanest unified fix.
+The loader now uses FBX `Cluster.Transform` as the inverse-bind matrix when the
+skin mesh has no baked geometric transform, and writes it to both Babylon
+fields. In that same path, skinned meshes are kept out of the animated bone
+`TransformNode` parent chain. Skins with baked geometric transforms keep the
+legacy hierarchy path, which avoids regressing assets such as `archer/ArcherRi01`.
 
 ---
 
