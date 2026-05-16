@@ -15,18 +15,28 @@ attribute vec4 aColor;
 attribute vec2 aTexCoord;
 attribute vec4 aBoneIndex;
 attribute vec4 aBoneWeight;
+attribute vec3 aMorph0;
+attribute vec3 aMorph1;
+attribute vec3 aMorph2;
+attribute vec3 aMorph3;
 
 uniform mat4 uViewProj;
 uniform mat4 uModel;
 uniform mat3 uNormalMat;
 uniform bool uSkinned;
 uniform mat4 uBones[64];
+uniform vec4 uMorphWeights;
 
 varying vec3 vNormal;
 varying vec4 vColor;
 varying vec2 vTexCoord;
 
 void main() {
+    vec3 morphed = aPosition
+        + aMorph0 * uMorphWeights.x
+        + aMorph1 * uMorphWeights.y
+        + aMorph2 * uMorphWeights.z
+        + aMorph3 * uMorphWeights.w;
     vec4 pos;
     vec3 nrm;
     if (uSkinned) {
@@ -35,10 +45,10 @@ void main() {
             aBoneWeight.y * uBones[int(aBoneIndex.y)] +
             aBoneWeight.z * uBones[int(aBoneIndex.z)] +
             aBoneWeight.w * uBones[int(aBoneIndex.w)];
-        pos = skin * vec4(aPosition, 1.0);
+        pos = skin * vec4(morphed, 1.0);
         nrm = mat3(skin) * aNormal;
     } else {
-        pos = uModel * vec4(aPosition, 1.0);
+        pos = uModel * vec4(morphed, 1.0);
         nrm = uNormalMat * aNormal;
     }
     vNormal = normalize(nrm);
