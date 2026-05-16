@@ -944,6 +944,7 @@ async function loadModel(name) {
     const skinNote  = totalBones  ? ` — bones: ${totalBones}`   : '';
     const morphNote = totalMorphs ? ` — morphs: ${totalMorphs}` : '';
     setStatus(`${name} — triangles: ${totalTriangles}${duration ? ` — anim ${duration.toFixed(2)}s` : ''}${skinNote}${morphNote}`);
+    updateMorphGui(totalMorphs > 0);
 }
 
 function setStatus(msg) {
@@ -1094,10 +1095,21 @@ function render(timeMs) {
 // GUI
 // =====================================================================
 
+let morphCtrl = null;
+
 function initGui() {
     const gui = new lil.GUI();
     gui.add(PARAMS, 'asset', ASSETS).name('asset').onChange(loadModel);
     gui.add(PARAMS, 'animate').name('play');
+    morphCtrl = gui.add(PARAMS, 'morph', 0, 1, 0.01).name('morph weight');
+    morphCtrl.hide();
+}
+
+// Show the morph slider only when the loaded model has BlendShape channels.
+function updateMorphGui(hasMorphs) {
+    if (!morphCtrl) return;
+    if (hasMorphs) morphCtrl.show();
+    else morphCtrl.hide();
 }
 
 // =====================================================================
