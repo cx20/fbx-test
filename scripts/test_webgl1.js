@@ -29,6 +29,7 @@ const MODELS = [
     { name: 'test/anim_skin_bend',      file: 'anim-skin-bend-t1',        time: 1.0 },
     { name: 'morph_test',               file: 'morph-test',               time: 0 },
     { name: 'morph-translation',        file: 'morph-translation',        time: 0 },
+    { name: 'stanford-bunny',           file: 'stanford-bunny',           time: 0 },
 ];
 
 (async () => {

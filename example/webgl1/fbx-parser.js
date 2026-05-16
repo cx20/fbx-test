@@ -1,4 +1,4 @@
-// fbx-parser.js — minimal binary FBX parser used by the WebGL samples.
+// fbx-parser.js — minimal binary + ASCII FBX parser used by the WebGL samples.
 //
 // Exposes a global `FBXParser` namespace with:
 //   parseFBX(buffer): Promise<{ version, nodes }>
@@ -9,9 +9,7 @@
 // Each parsed node is { name, props, children }.
 //
 // This is a trimmed copy of the parser embedded in
-// example/babylonjs/fbx-loader.js — supports only the binary FBX format
-// (which is what every model in this repo uses). For ASCII FBX use the
-// Babylon.js loader.
+// example/babylonjs/fbx-loader.js.
 
 (function (root) {
 
@@ -129,10 +127,119 @@ async function parseNodes(reader, endOffset, is64bit) {
     return nodes;
 }
 
+// ASCII FBX parser → same { name, props, children } tree.
+//
+// Grammar (simplified): each non-empty, non-comment line is
+//   <Name>: [<prop>, <prop>, ...]  [{
+//      <child nodes...>
+//   }]
+// Array properties (huge vertex/index lists) are written as
+//   *<count> {
+//      a: <comma-separated numbers, possibly on many lines>
+//   }
+// and are returned as a single `number[]` property to match the binary
+// parser's behavior.
+function parseAsciiNodes(text) {
+    const lines = text.split(/\r?\n/);
+    let pos = 0;
+
+    function nextContentLine() {
+        while (pos < lines.length) {
+            const line = lines[pos++].trim();
+            if (line && !line.startsWith(';')) return line;
+        }
+        return null;
+    }
+
+    function parseScalarProps(str) {
+        const props = [];
+        let i = 0;
+        while (i < str.length) {
+            while (i < str.length && (str[i] === ',' || str[i] === ' ' || str[i] === '\t')) i++;
+            if (i >= str.length) break;
+            if (str[i] === '"') {
+                let j = i + 1;
+                while (j < str.length && str[j] !== '"') j++;
+                props.push(str.slice(i + 1, j));
+                i = j + 1;
+            } else {
+                let j = i;
+                while (j < str.length && str[j] !== ',' && str[j] !== ' ' && str[j] !== '\t') j++;
+                const token = str.slice(i, j).trim();
+                if (token.length) {
+                    const num = Number(token);
+                    props.push(Number.isNaN(num) ? token : num);
+                }
+                i = j;
+            }
+        }
+        return props;
+    }
+
+    function readArrayValues() {
+        const values = [];
+        while (pos < lines.length) {
+            const line = lines[pos++].trim();
+            if (!line || line.startsWith(';')) continue;
+            if (line === '}') break;
+            const start = line.startsWith('a:') ? 2 : 0;
+            for (const token of line.slice(start).split(',')) {
+                const t = token.trim();
+                if (t) values.push(Number(t));
+            }
+        }
+        return values;
+    }
+
+    function parseNode(line) {
+        const colonIdx = line.indexOf(':');
+        if (colonIdx < 0) return null;
+        const name = line.slice(0, colonIdx).trim();
+        let rest = line.slice(colonIdx + 1).trim();
+
+        const hasBlock = rest.endsWith('{');
+        if (hasBlock) rest = rest.slice(0, -1).trim();
+
+        const props = [];
+        const children = [];
+
+        if (rest.startsWith('*')) {
+            if (hasBlock) props.push(readArrayValues());
+        } else {
+            if (rest.length > 0) props.push(...parseScalarProps(rest));
+            if (hasBlock) {
+                while (true) {
+                    const child = nextContentLine();
+                    if (!child || child === '}') break;
+                    const node = parseNode(child);
+                    if (node) children.push(node);
+                }
+            }
+        }
+
+        return { name, props, children };
+    }
+
+    const nodes = [];
+    while (true) {
+        const line = nextContentLine();
+        if (!line) break;
+        if (line === '}') continue;
+        const node = parseNode(line);
+        if (node) nodes.push(node);
+    }
+    return nodes;
+}
+
 async function parseFBX(buffer) {
     const peek = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(buffer, 0, 23));
     if (!peek.startsWith('Kaydara FBX Binary')) {
-        throw new Error('ASCII FBX is not supported by this parser. Use example/babylonjs/fbx-loader.js for ASCII files.');
+        const text = new TextDecoder().decode(buffer);
+        const nodes = parseAsciiNodes(text);
+        const headerExt = nodes.find(n => n.name === 'FBXHeaderExtension');
+        const versionNode = headerExt?.children.find(n => n.name === 'FBXVersion');
+        const version = typeof versionNode?.props[0] === 'number' ? versionNode.props[0] : 7500;
+        return { version, nodes };
     }
     const reader = new FBXReader(buffer);
     reader.skip(23); // magic header (21 bytes + 0x1A 0x00)
