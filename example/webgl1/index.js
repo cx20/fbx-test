@@ -413,7 +413,10 @@ function sampleCurve(curve, time, fallback) {
 
 // Walk Connections to find AnimationCurveNodes that target `modelId`, then
 // find the AnimationCurves under each ACN by axis (d|X/Y/Z).
-function buildAnimation(roots, modelId) {
+//
+// `layerAcnIds` (optional): restrict to ACNs in this AnimationLayer set, so
+// each AnimationStack ("clip") gets its own curves instead of merging them.
+function buildAnimation(roots, modelId, layerAcnIds) {
     const objects = findNode(roots, 'Objects');
     const conns   = findNode(roots, 'Connections');
     if (!objects || !conns) return null;
@@ -452,6 +455,7 @@ function buildAnimation(roots, modelId) {
     let duration = 0;
     for (const [acnId, target] of acnTarget) {
         if (target.modelId !== modelId) continue;
+        if (layerAcnIds && !layerAcnIds.has(acnId)) continue;
         const key = target.prop === 'Lcl Translation' ? 'T'
                   : target.prop === 'Lcl Rotation'    ? 'R'
                   : target.prop === 'Lcl Scaling'     ? 'S'
@@ -470,7 +474,8 @@ function buildAnimation(roots, modelId) {
 
 // Walk Connections to find an AnimationCurveNode targeting `channelId`'s
 // DeformPercent (BlendShapeChannel weight). Returns a single curve or null.
-function buildMorphAnimation(roots, channelId) {
+// `layerAcnIds` filters to a specific AnimationLayer (see `buildAnimation`).
+function buildMorphAnimation(roots, channelId, layerAcnIds) {
     const objects = findNode(roots, 'Objects');
     const conns   = findNode(roots, 'Connections');
     if (!objects || !conns) return null;
@@ -484,12 +489,14 @@ function buildMorphAnimation(roots, channelId) {
         curveById.set(n.props[0], n);
     }
 
-    // Find ACN that targets DeformPercent on this channel.
+    // Find ACN that targets DeformPercent on this channel (and is part of
+    // the requested layer, when one was supplied).
     let targetAcn = null;
     for (const c of conns.children) {
         if (c.name !== 'C' || c.props[0] !== 'OP') continue;
         const [, fromId, toId, prop] = c.props;
         if (toId === channelId && acnById.has(fromId) && prop === 'DeformPercent') {
+            if (layerAcnIds && !layerAcnIds.has(fromId)) continue;
             targetAcn = fromId; break;
         }
     }
@@ -754,7 +761,8 @@ function buildMorphForGeometry(geoNode, vertexCount, conns, geoById, deformerByI
 // accumulating local transforms (with animations) and then appending the
 // leaf node's geometric transform (GeometricTranslation/Rotation/Scaling).
 function getWorldMatrix(leafModelId, time, scene) {
-    const { parentOf, modelById, baseTRSOf, animationsOf } = scene;
+    const { parentOf, modelById, baseTRSOf } = scene;
+    const animationsOf = scene.clips[scene.currentClip]?.animationsOf ?? new Map();
 
     // Collect ancestor chain from root down to leafModelId
     const chain = [];
@@ -859,14 +867,59 @@ async function loadModel(name) {
     const baseTRSOf = new Map();
     for (const [id, m] of modelById) baseTRSOf.set(id, getProps70(m));
 
-    // Per-model animations
-    const animationsOf = new Map();
-    for (const [id] of modelById) {
-        const anim = buildAnimation(nodes, id);
-        if (anim) animationsOf.set(id, anim);
+    // ---- Animation clips ----
+    // Each AnimationStack is one clip. Layers under it carry the ACNs; many
+    // FBX files use a single layer per stack, but we union them all just in
+    // case. ACN-less stacks (e.g. an empty "Take 001" stub) are dropped.
+    const stackById = new Map(findNodes(objects.children, 'AnimationStack').map(n => [n.props[0], n]));
+    const layerInfoById = new Map();
+    for (const layer of findNodes(objects.children, 'AnimationLayer')) {
+        layerInfoById.set(layer.props[0], { stackId: null, acns: new Set() });
     }
-    let duration = 0;
-    for (const a of animationsOf.values()) duration = Math.max(duration, a.duration);
+    for (const c of connsNode.children) {
+        if (c.name !== 'C' || c.props[0] !== 'OO') continue;
+        const [, fromId, toId] = c.props;
+        if (layerInfoById.has(fromId) && stackById.has(toId)) {
+            layerInfoById.get(fromId).stackId = toId;
+        }
+    }
+    for (const c of connsNode.children) {
+        if (c.name !== 'C' || c.props[0] !== 'OO') continue;
+        const [, fromId, toId] = c.props;
+        if (layerInfoById.has(toId)) layerInfoById.get(toId).acns.add(fromId);
+    }
+
+    const stripFbxTag = s => {
+        const i = (s ?? '').indexOf('\x00');
+        return i >= 0 ? s.slice(0, i) : (s ?? '');
+    };
+
+    const clipStubs = []; // { name, stackId, acns: Set }
+    for (const [stackId, stack] of stackById) {
+        const acns = new Set();
+        for (const { stackId: lsid, acns: lacns } of layerInfoById.values()) {
+            if (lsid === stackId) for (const a of lacns) acns.add(a);
+        }
+        if (acns.size === 0) continue;
+        clipStubs.push({ name: stripFbxTag(stack.props[1]), stackId, acns });
+    }
+    // Fallback: no clean stacks → one "global" clip containing every ACN
+    // (covers files without AnimationStack/Layer structure).
+    if (clipStubs.length === 0) {
+        clipStubs.push({ name: 'default', stackId: null, acns: null });
+    }
+
+    // Per-clip per-model TRS animations.
+    const clips = clipStubs.map(stub => {
+        const animationsOf = new Map();
+        for (const [id] of modelById) {
+            const anim = buildAnimation(nodes, id, stub.acns);
+            if (anim) animationsOf.set(id, anim);
+        }
+        let duration = 0;
+        for (const a of animationsOf.values()) duration = Math.max(duration, a.duration);
+        return { name: stub.name, animationsOf, morphAnimsByChannel: new Map(), duration };
+    });
 
     // Trace Model→Material→Texture→Video to find the Video node for a mesh
     function findVideoForModel(modelId) {
@@ -913,11 +966,16 @@ async function loadModel(name) {
         const vertexCount = verts ? verts.length / 3 : 0;
         const skin = buildSkinForGeometry(geoNode, vertexCount, connsNode, deformerById, modelById);
         const morph = buildMorphForGeometry(geoNode, vertexCount, connsNode, geoById, deformerById);
-        // Attach a per-channel animation curve (DeformPercent) if present.
+        // Attach a per-channel DeformPercent curve to each clip if present.
         if (morph) {
             for (const ch of morph.channels) {
-                ch.animation = buildMorphAnimation(nodes, ch.channelId);
-                if (ch.animation) duration = Math.max(duration, ch.animation.duration);
+                for (let i = 0; i < clipStubs.length; i++) {
+                    const anim = buildMorphAnimation(nodes, ch.channelId, clipStubs[i].acns);
+                    if (anim) {
+                        clips[i].morphAnimsByChannel.set(ch.channelId, anim);
+                        clips[i].duration = Math.max(clips[i].duration, anim.duration);
+                    }
+                }
             }
         }
         const morphDeltas = morph ? morph.channels.map(ch => ch.deltas) : null;
@@ -939,12 +997,24 @@ async function loadModel(name) {
         if (morph) totalMorphs += morph.channels.length;
     }
 
+    // Drop clips that ended up with no curves at all (e.g. a stub stack).
+    const liveClips = clips.filter((c, i) =>
+        c.animationsOf.size > 0 || c.morphAnimsByChannel.size > 0 || clipStubs[i].stackId === null);
+    const sceneClips = liveClips.length ? liveClips : [{ name: 'default', animationsOf: new Map(), morphAnimsByChannel: new Map(), duration: 0 }];
+
     const scale = SCALES.get(name) ?? 1;
-    scene = { meshes, parentOf, modelById, baseTRSOf, animationsOf, duration, modelName: name, scale };
+    scene = {
+        meshes, parentOf, modelById, baseTRSOf,
+        clips: sceneClips, currentClip: 0,
+        modelName: name, scale,
+    };
     const skinNote  = totalBones  ? ` — bones: ${totalBones}`   : '';
     const morphNote = totalMorphs ? ` — morphs: ${totalMorphs}` : '';
-    setStatus(`${name} — triangles: ${totalTriangles}${duration ? ` — anim ${duration.toFixed(2)}s` : ''}${skinNote}${morphNote}`);
+    const clipNote  = sceneClips.length > 1 ? ` — clips: ${sceneClips.length}` : '';
+    const dur = sceneClips[0]?.duration ?? 0;
+    setStatus(`${name} — triangles: ${totalTriangles}${dur ? ` — anim ${dur.toFixed(2)}s` : ''}${skinNote}${morphNote}${clipNote}`);
     updateMorphGui(totalMorphs > 0);
+    updateClipGui(sceneClips);
 }
 
 function setStatus(msg) {
@@ -956,8 +1026,9 @@ function setStatus(msg) {
 // =====================================================================
 
 function render(timeMs) {
-    if (PARAMS.animate && scene?.duration) {
-        PARAMS.time = (timeMs / 1000) % scene.duration;
+    const currentDuration = scene?.clips[scene.currentClip]?.duration ?? 0;
+    if (PARAMS.animate && currentDuration) {
+        PARAMS.time = (timeMs / 1000) % currentDuration;
     }
 
     resize();
@@ -1062,6 +1133,7 @@ function render(timeMs) {
         // the matching weight components. Unused slots get a zero constant so
         // they cleanly contribute nothing.
         const morphChannels = mesh.morph?.channels ?? [];
+        const morphAnims = scene.clips[scene.currentClip]?.morphAnimsByChannel ?? new Map();
         const morphWeights = [0, 0, 0, 0];
         for (let m = 0; m < MAX_MORPHS; m++) {
             const loc = attribs.morph[m];
@@ -1071,12 +1143,11 @@ function render(timeMs) {
                 gl.enableVertexAttribArray(loc);
                 gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0);
                 const ch = morphChannels[m];
-                const pct = ch.animation
-                    ? sampleCurve(ch.animation.curve, PARAMS.time, 0)
-                    : 0;
-                // Use animated DeformPercent (0..100) if present, else the
+                const anim = morphAnims.get(ch.channelId);
+                // Use animated DeformPercent (0..100) if the current clip
+                // animates this channel, else the `morph weight` slider /
                 // `?morph=` URL override (0..1) for manual inspection.
-                morphWeights[m] = ch.animation ? pct / 100 : PARAMS.morph;
+                morphWeights[m] = anim ? sampleCurve(anim.curve, PARAMS.time, 0) / 100 : PARAMS.morph;
             } else {
                 gl.disableVertexAttribArray(loc);
                 gl.vertexAttrib3f(loc, 0, 0, 0);
@@ -1096,11 +1167,22 @@ function render(timeMs) {
 // =====================================================================
 
 let morphCtrl = null;
+let clipCtrl = null;
+const CLIP_PARAM = { clip: '' };
 
 function initGui() {
     const gui = new lil.GUI();
     gui.add(PARAMS, 'asset', ASSETS).name('asset').onChange(loadModel);
     gui.add(PARAMS, 'animate').name('play');
+    clipCtrl = gui.add(CLIP_PARAM, 'clip', ['']).name('clip').onChange(name => {
+        if (!scene) return;
+        const idx = scene.clips.findIndex(c => c.name === name);
+        if (idx >= 0) {
+            scene.currentClip = idx;
+            PARAMS.time = 0;
+        }
+    });
+    clipCtrl.hide();
     morphCtrl = gui.add(PARAMS, 'morph', 0, 1, 0.01).name('morph weight');
     morphCtrl.hide();
 }
@@ -1110,6 +1192,27 @@ function updateMorphGui(hasMorphs) {
     if (!morphCtrl) return;
     if (hasMorphs) morphCtrl.show();
     else morphCtrl.hide();
+}
+
+// Repopulate the clip dropdown with the loaded scene's clip names. The
+// dropdown only shows when there's more than one named clip — single-clip
+// models keep the panel uncluttered.
+function updateClipGui(clips) {
+    if (!clipCtrl) return;
+    const names = clips.map(c => c.name);
+    CLIP_PARAM.clip = names[0] ?? '';
+    // lil-gui requires rebuilding the <option> list via the .options() method.
+    clipCtrl = clipCtrl.options(names);
+    clipCtrl.onChange(name => {
+        if (!scene) return;
+        const idx = scene.clips.findIndex(c => c.name === name);
+        if (idx >= 0) {
+            scene.currentClip = idx;
+            PARAMS.time = 0;
+        }
+    });
+    if (names.length > 1) clipCtrl.show();
+    else clipCtrl.hide();
 }
 
 // =====================================================================
