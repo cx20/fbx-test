@@ -969,11 +969,28 @@ async function _buildFBXScene(buffer, baseDir, scene, options = {}) {
                 const clusterId = clusterByBoneModelId.get(boneModelId);
                 if (clusterId !== undefined) {
                     const clusterNode = clusterById.get(clusterId);
+                    const transformData = prop0(findNode(clusterNode.children, 'Transform'));
                     const tlData = prop0(findNode(clusterNode.children, 'TransformLink'));
-                    if (Array.isArray(tlData) && tlData.length === 16) {
+                    if (Array.isArray(transformData) && transformData.length === 16) {
+                        // FBX SDK: cluster.Transform = inv(TransformLink) × meshWorldAtBind,
+                        // exactly the inverse bind we want when mesh.world (BJS) equals the
+                        // bone ancestor chain's world (= Armature.world in this loader's
+                        // setup). Used directly as the bind matrix override fixes the
+                        // RiggedFigure shoulder ROM divergence.
+                        const invBind = fbxTransformLinkToBabylon(transformData);
+                        bone._invertedAbsoluteTransform = invBind;
+                        // Newer BJS builds use `_absoluteInverseBindMatrix`; mirror the value
+                        // so both code paths see the same matrix.
+                        if ('_absoluteInverseBindMatrix' in bone) {
+                            bone._absoluteInverseBindMatrix = invBind;
+                        }
+                    } else if (Array.isArray(tlData) && tlData.length === 16) {
                         const invTL = new BABYLON.Matrix();
                         fbxTransformLinkToBabylon(tlData).invertToRef(invTL);
                         bone._invertedAbsoluteTransform = invTL;
+                        if ('_absoluteInverseBindMatrix' in bone) {
+                            bone._absoluteInverseBindMatrix = invTL;
+                        }
                     }
                 }
 
