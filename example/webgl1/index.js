@@ -339,7 +339,7 @@ function uploadMesh(meshData) {
     }
 
     // Use Uint32 indices for meshes with more than 65535 expanded vertices
-    const needU32 = meshData.positions.length / 3 >= 65536;
+    const needU32 = meshData.positions.length / 3 > 65535;
     const idxData = needU32 ? new Uint32Array(meshData.indices) : new Uint16Array(meshData.indices);
     const idxType = needU32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
 
