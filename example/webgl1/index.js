@@ -228,7 +228,12 @@ function makeLocalMatrix(T, preR, R, S) {
 // skinning attributes (4 bones per vertex) are expanded alongside positions.
 // If `morphDeltas` is provided (Float32Array[], one per channel), per-vertex
 // position deltas are expanded alongside positions.
-function buildMesh(geoNode, skinPerVertex, morphDeltas) {
+// If `materialColors` is provided (Array<[r,g,b]>, indexed by the per-polygon
+// material index from LayerElementMaterial) AND the geometry has a ByPolygon
+// material layer that references more than one material, the per-polygon
+// diffuse colors are baked into aColor / vColor — the cleanest way to render
+// multi-material meshes (e.g. Head_69) without splitting them into sub-meshes.
+function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors) {
     const verts = prop0(findNode(geoNode.children, 'Vertices'));
     const polyIdxNode = findNode(geoNode.children, 'PolygonVertexIndex');
     if (!verts || !polyIdxNode) return null;
@@ -254,6 +259,19 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas) {
     const normalsData = readLayer('LayerElementNormal', 'Normals', 'NormalsIndex');
     const colorsData  = readLayer('LayerElementColor',  'Colors',  'ColorIndex');
     const uvsData     = readLayer('LayerElementUV',     'UV',      'UVIndex');
+
+    // Per-polygon material index (when the FBX assigns multiple materials to
+    // a single mesh, e.g. Head_69 with 43 face materials). We only treat it
+    // as "multi-material" when the layer actually references more than one
+    // distinct material; AllSame / single-index cases fall back to the
+    // existing single-uBaseColor path.
+    const materialLayer = findNode(geoNode.children, 'LayerElementMaterial');
+    const matsArrNode   = materialLayer ? findNode(materialLayer.children, 'Materials') : null;
+    const matMappingNode = materialLayer ? findNode(materialLayer.children, 'MappingInformationType') : null;
+    const matsArr = matsArrNode?.props[0] ?? null;
+    const matMapping = matMappingNode?.props[0] ?? 'AllSame';
+    const useMatColors = materialColors && matsArr && matMapping === 'ByPolygon'
+        && new Set(matsArr).size > 1;
 
     function lookup(layer, stride, pvIdx, polyIdx, vIdx, fallback) {
         if (!layer) return fallback;
@@ -290,8 +308,14 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas) {
         outPositions.push(verts[v * 3], verts[v * 3 + 1], verts[v * 3 + 2]);
         const n = lookup(normalsData, 3, i, polyId, v, [0, 0, 1]);
         outNormals.push(n[0], n[1], n[2]);
-        const c = lookup(colorsData, 4, i, polyId, v, [1, 1, 1, 1]);
-        outColors.push(c[0], c[1], c[2], c[3]);
+        if (useMatColors) {
+            const mi = matsArr[polyId] ?? 0;
+            const mc = materialColors[mi] ?? [1, 1, 1];
+            outColors.push(mc[0], mc[1], mc[2], 1);
+        } else {
+            const c = lookup(colorsData, 4, i, polyId, v, [1, 1, 1, 1]);
+            outColors.push(c[0], c[1], c[2], c[3]);
+        }
         const uv = lookup(uvsData, 2, i, polyId, v, [0, 0]);
         outUVs.push(uv[0], 1.0 - uv[1]); // FBX UV V=0 is top; WebGL V=0 is bottom
         if (skinPerVertex) {
@@ -324,7 +348,7 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas) {
         morphs:    outMorphs.map(a => new Float32Array(a)),
         indices:   outIndices,               // plain number[] — converted to Uint16Array/Uint32Array in uploadMesh
         triangleCount: outIndices.length / 3,
-        hasVertexColor: !!colorsData,
+        hasVertexColor: !!colorsData || useMatColors,
         hasUVs: !!uvsData,
         hasSkin: !!skinPerVertex,
     };
@@ -936,23 +960,40 @@ async function loadModel(name) {
         return null;
     }
 
-    // Read DiffuseColor (× DiffuseFactor) from the first Material attached to a Model.
-    function findMaterialColorForModel(modelId) {
-        for (const matId of reverseConns.get(modelId) ?? []) {
-            if (!matById.has(matId)) continue;
-            const p70 = findNode(matById.get(matId).children, 'Properties70');
-            if (!p70) continue;
-            let diffuse = null, factor = 1;
-            for (const p of p70.children) {
-                if (p.name !== 'P' || !p.props) continue;
-                const k = p.props[0];
-                if ((k === 'DiffuseColor' || k === 'Diffuse') && p.props.length > 6) {
-                    diffuse = [p.props[4], p.props[5], p.props[6]];
-                } else if (k === 'DiffuseFactor' && p.props.length > 4) {
-                    factor = p.props[4];
-                }
+    // Extract DiffuseColor (× DiffuseFactor) from a single Material node.
+    function readMaterialColor(matNode) {
+        const p70 = findNode(matNode.children, 'Properties70');
+        if (!p70) return null;
+        let diffuse = null, factor = 1;
+        for (const p of p70.children) {
+            if (p.name !== 'P' || !p.props) continue;
+            const k = p.props[0];
+            if ((k === 'DiffuseColor' || k === 'Diffuse') && p.props.length > 6) {
+                diffuse = [p.props[4], p.props[5], p.props[6]];
+            } else if (k === 'DiffuseFactor' && p.props.length > 4) {
+                factor = p.props[4];
             }
-            if (diffuse) return [diffuse[0] * factor, diffuse[1] * factor, diffuse[2] * factor];
+        }
+        if (!diffuse) return null;
+        return [diffuse[0] * factor, diffuse[1] * factor, diffuse[2] * factor];
+    }
+
+    // Ordered list of Materials connected to a Model (in OO-connection order).
+    // The per-polygon `LayerElementMaterial.Materials` array indexes into this.
+    function findMaterialsForModel(modelId) {
+        const mats = [];
+        for (const matId of reverseConns.get(modelId) ?? []) {
+            if (matById.has(matId)) mats.push(matById.get(matId));
+        }
+        return mats;
+    }
+
+    // First Material's diffuse color (used when the mesh isn't multi-material).
+    function findMaterialColorForModel(modelId) {
+        const mats = findMaterialsForModel(modelId);
+        for (const m of mats) {
+            const c = readMaterialColor(m);
+            if (c) return c;
         }
         return null;
     }
@@ -980,7 +1021,9 @@ async function loadModel(name) {
             }
         }
         const morphDeltas = morph ? morph.channels.map(ch => ch.deltas) : null;
-        const meshData = buildMesh(geoNode, skin, morphDeltas);
+        const matsForModel = findMaterialsForModel(modelId);
+        const matColors = matsForModel.map(m => readMaterialColor(m) ?? [1, 1, 1]);
+        const meshData = buildMesh(geoNode, skin, morphDeltas, matColors);
         if (!meshData) continue;
         const gpu = uploadMesh(meshData);
         let texture = null;
