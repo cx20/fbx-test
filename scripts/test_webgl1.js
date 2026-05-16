@@ -32,6 +32,8 @@ const MODELS = [
     { name: 'morph-translation',        file: 'morph-translation-w0',     time: 0, extra: '&morph=0'   },
     { name: 'morph-translation',        file: 'morph-translation-w1',     time: 0, extra: '&morph=1'   },
     { name: 'stanford-bunny',           file: 'stanford-bunny',           time: 0 },
+    { name: 'warrior/Warrior',          file: 'warrior-mv_tar21',         time: 0, extra: '&clip=mv_tar21' },
+    { name: 'gltf/Fox',                 file: 'fox-survey',               time: 0, extra: '&clip=Survey'   },
 ];
 
 (async () => {

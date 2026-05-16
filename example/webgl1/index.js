@@ -69,6 +69,7 @@ const PARAMS = {
     animate:  getBoolParam('animation', true),
     time:     Number(SEARCH_PARAMS.get('time')) || 0,
     morph:    Number(SEARCH_PARAMS.get('morph')) || 0,
+    clip:     SEARCH_PARAMS.get('clip') ?? null, // honored once on first load
 };
 
 // =====================================================================
@@ -1197,10 +1198,23 @@ function updateMorphGui(hasMorphs) {
 // Repopulate the clip dropdown with the loaded scene's clip names. The
 // dropdown only shows when there's more than one named clip — single-clip
 // models keep the panel uncluttered.
+//
+// If `?clip=<name>` was provided on the URL, that clip becomes the initial
+// selection (honored only on the first load; subsequent loadModel calls fall
+// back to the first clip).
 function updateClipGui(clips) {
     if (!clipCtrl) return;
     const names = clips.map(c => c.name);
-    CLIP_PARAM.clip = names[0] ?? '';
+
+    let initialIdx = 0;
+    if (PARAMS.clip) {
+        const requested = names.indexOf(PARAMS.clip);
+        if (requested >= 0) initialIdx = requested;
+        PARAMS.clip = null; // honor only on first load
+    }
+    if (scene) scene.currentClip = initialIdx;
+    CLIP_PARAM.clip = names[initialIdx] ?? '';
+
     // lil-gui requires rebuilding the <option> list via the .options() method.
     clipCtrl = clipCtrl.options(names);
     clipCtrl.onChange(name => {
