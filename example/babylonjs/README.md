@@ -9,26 +9,12 @@ For end-user API/usage, see the [top-level README](../../README.md).
 
 ## Known issues
 
-(none currently — see "Resolved issues" below)
-
-## Resolved issues
-
-### 1. ~~Shoulder ROM (range of motion) mismatch on `gltf/RiggedFigure`~~ — fixed
+### 1. Shoulder ROM (range of motion) mismatch on `gltf/RiggedFigure`
 
 **Symptom.** With the `Armature|Anim_0.002` clip at non-zero animation times,
-the arms in the Babylon.js viewer stayed nearly horizontal (T-pose-like), whereas
+the arms in the Babylon.js viewer stay nearly horizontal (T-pose-like), whereas
 the Three.js viewer correctly drops them to an A-pose angle. The legs and torso
-looked approximately correct; only the shoulder rotation diverged.
-
-**Resolution.** The loader was overriding only the legacy
-`bone._invertedAbsoluteTransform` field with the FBX cluster's `Transform`
-matrix (`inv(TransformLink) × meshWorldAtBind`, the algebraically-correct
-inverse bind for this loader's mesh-parented setup). But the current dev
-build of Babylon.js consumes `bone._absoluteInverseBindMatrix` for GPU
-skinning; setting the legacy field alone was a silent no-op there. Mirror
-the matrix into both fields and the arm chain tracks the animation curves.
-
-The history below is preserved for context.
+look approximately correct; only the shoulder rotation diverges.
 
 | Babylon.js (current) | Three.js (reference) |
 |---|---|
