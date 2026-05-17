@@ -9,26 +9,34 @@
 <body>
 
 <script id="wgsl" type="x-shader/wgsl">
-// Uniform layout — single buffer per mesh, all values updated per frame.
+// Two uniform buffers: per-mesh (matrices, bones, etc.) and per-material
+// (baseColor + texture). The split lets one mesh issue multiple draw calls,
+// each with its own material binding, so meshes like morph-translation's
+// paillottes (paillotte.png + paillotte_extremite.png on different polygons)
+// render with the correct texture per polygon group.
 //
 // WGSL alignment rules (std140-style) require vec3/vec4/mat3/mat4 fields to
 // sit on 16-byte boundaries; using mat4 in place of mat3 for `normalMat` and
 // padding scalars to vec4 avoids hand-counting offsets.
-struct Uniforms {
+struct MeshUniforms {
     viewProj:     mat4x4f,
     model:        mat4x4f,
     normalMat:    mat4x4f,
-    baseColor:    vec4f,
     lightDir:     vec4f, // .xyz used
     ambient:      vec4f, // .x used
     morphWeights: vec4f,
-    flags:        vec4u, // x=hasVertexColor y=hasTexture z=skinned
+    flags:        vec4u, // x=hasVertexColor z=skinned
     bones:        array<mat4x4f, 64>,
 };
+struct MaterialUniforms {
+    baseColor:    vec4f,
+    flags:        vec4u, // x=hasTexture
+};
 
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var tex: texture_2d<f32>;
-@group(0) @binding(2) var samp: sampler;
+@group(0) @binding(0) var<uniform> u: MeshUniforms;
+@group(1) @binding(0) var<uniform> m: MaterialUniforms;
+@group(1) @binding(1) var tex: texture_2d<f32>;
+@group(1) @binding(2) var samp: sampler;
 
 struct VsIn {
     @location(0) position:   vec3f,
@@ -92,21 +100,21 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
     let diffuse = max(dot(N, normalize(u.lightDir.xyz)), 0.0);
     let shade = ambientLight + vec3f(diffuse) * (1.0 - u.ambient.x);
     var base: vec4f;
-    if (u.flags.y != 0u) {
+    if (m.flags.x != 0u) {
         // Multiply the sampled texel by the material's diffuse color, matching
         // Three.js / Babylon.js. Without this, meshes whose material carries a
         // non-white DiffuseColor (e.g. morph-translation's paillotte at 0.5,0.5,0.5)
         // render brighter than they should.
-        base = textureSample(tex, samp, in.texCoord) * u.baseColor;
+        base = textureSample(tex, samp, in.texCoord) * m.baseColor;
     } else if (u.flags.x != 0u) {
         base = in.color;
     } else {
-        base = u.baseColor;
+        base = m.baseColor;
     }
     // Alpha-test for textures with cut-out transparency (e.g. morph-translation's
     // paillotte.png basket-weave). Cheaper than alpha blending and needs no depth
     // sorting; for textures without true transparency, alpha is ~1 so this is a no-op.
-    if (u.flags.y != 0u && base.a < 0.5) {
+    if (m.flags.x != 0u && base.a < 0.5) {
         discard;
     }
     return vec4f(base.rgb * shade, base.a);
