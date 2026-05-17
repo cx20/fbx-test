@@ -233,7 +233,11 @@ function makeLocalMatrix(T, preR, R, S) {
 // material layer that references more than one material, the per-polygon
 // diffuse colors are baked into aColor / vColor — the cleanest way to render
 // multi-material meshes (e.g. Head_69) without splitting them into sub-meshes.
-function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors) {
+// If `geometricTransform` is provided ({ T, R, S }) it is baked into vertex
+// positions and normals here so skinned meshes (where it can't be applied
+// externally via the model matrix) still see it. The non-skinned path in
+// getWorldMatrix() no longer needs to append it for these meshes.
+function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors, geometricTransform) {
     const verts = prop0(findNode(geoNode.children, 'Vertices'));
     const polyIdxNode = findNode(geoNode.children, 'PolygonVertexIndex');
     if (!verts || !polyIdxNode) return null;
@@ -288,6 +292,24 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors) {
         return out;
     }
 
+    // Precompute the geometric transform as a 4x4 matrix (or null when identity)
+    // so it can be applied to every vertex position / normal at expansion time.
+    let geoMat = null, geoNormMat = null;
+    if (geometricTransform) {
+        const { T = [0,0,0], R = [0,0,0], S = [1,1,1] } = geometricTransform;
+        const hasAny = T[0] || T[1] || T[2] || R[0] || R[1] || R[2]
+                     || S[0] !== 1 || S[1] !== 1 || S[2] !== 1;
+        if (hasAny) {
+            geoMat = makeLocalMatrix(T, null, R, S);
+            // Normal transform: rotation-only part of geoMat (no translation; uniform-scale
+            // safe since we don't expect non-uniform scale on geometric transforms here).
+            geoNormMat = mat3.create();
+            mat3.normalFromMat4(geoNormMat, geoMat);
+        }
+    }
+    const tmpPos = vec3.create();
+    const tmpNrm = vec3.create();
+
     const outPositions = [];
     const outNormals   = [];
     const outColors    = [];
@@ -305,9 +327,22 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors) {
         const isEnd = raw < 0;
         const v = isEnd ? ~raw : raw;
 
-        outPositions.push(verts[v * 3], verts[v * 3 + 1], verts[v * 3 + 2]);
+        if (geoMat) {
+            vec3.set(tmpPos, verts[v*3], verts[v*3+1], verts[v*3+2]);
+            vec3.transformMat4(tmpPos, tmpPos, geoMat);
+            outPositions.push(tmpPos[0], tmpPos[1], tmpPos[2]);
+        } else {
+            outPositions.push(verts[v * 3], verts[v * 3 + 1], verts[v * 3 + 2]);
+        }
         const n = lookup(normalsData, 3, i, polyId, v, [0, 0, 1]);
-        outNormals.push(n[0], n[1], n[2]);
+        if (geoNormMat) {
+            vec3.set(tmpNrm, n[0], n[1], n[2]);
+            vec3.transformMat3(tmpNrm, tmpNrm, geoNormMat);
+            vec3.normalize(tmpNrm, tmpNrm);
+            outNormals.push(tmpNrm[0], tmpNrm[1], tmpNrm[2]);
+        } else {
+            outNormals.push(n[0], n[1], n[2]);
+        }
         if (useMatColors) {
             const mi = matsArr[polyId] ?? 0;
             const mc = materialColors[mi] ?? [1, 1, 1];
@@ -812,13 +847,9 @@ function getWorldMatrix(leafModelId, time, scene) {
         mat4.multiply(world, world, makeLocalMatrix(trs.T, base.preR, trs.R, trs.S));
     }
 
-    // Apply geometric transform (fixed offset in local space, not animated)
-    const base = baseTRSOf.get(leafModelId);
-    if (base) {
-        const { geoT, geoR, geoS } = base;
-        const hasGeo = geoT.some(v => v !== 0) || geoR.some(v => v !== 0) || geoS.some(v => v !== 1);
-        if (hasGeo) mat4.multiply(world, world, makeLocalMatrix(geoT, null, geoR, geoS));
-    }
+    // GeometricTransform is no longer appended here: it gets baked into the
+    // mesh's vertex positions and normals at upload time (see buildMesh), so
+    // both skinned and non-skinned paths see it without the model matrix.
 
     return world;
 }
@@ -1028,7 +1059,15 @@ async function loadModel(name) {
         const morphDeltas = morph ? morph.channels.map(ch => ch.deltas) : null;
         const matsForModel = findMaterialsForModel(modelId);
         const matColors = matsForModel.map(m => readMaterialColor(m) ?? [1, 1, 1]);
-        const meshData = buildMesh(geoNode, skin, morphDeltas, matColors);
+        // Bake the mesh's GeometricTransform (FBX P70 GeometricTranslation/
+        // Rotation/Scaling) into vertex positions/normals. The non-skin code
+        // path used to append this matrix as the last factor in getWorldMatrix,
+        // but skinned meshes (e.g. archer's `weapon`, whose geometric transform
+        // positions the bow grip in the L Hand) skip the model matrix entirely
+        // and never saw it. Baking handles both paths the same way.
+        const baseTRS = baseTRSOf.get(modelId);
+        const geoXform = baseTRS ? { T: baseTRS.geoT, R: baseTRS.geoR, S: baseTRS.geoS } : null;
+        const meshData = buildMesh(geoNode, skin, morphDeltas, matColors, geoXform);
         if (!meshData) continue;
         const gpu = uploadMesh(meshData);
         let texture = null;
