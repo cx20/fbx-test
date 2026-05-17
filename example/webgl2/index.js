@@ -466,6 +466,7 @@ async function loadModel(name) {
     setStatus(`${name} — triangles: ${totalTriangles}${dur ? ` — anim ${dur.toFixed(2)}s` : ''}${skinNote}${morphNote}${clipNote}`);
     updateMorphGui(meshes);
     updateClipGui(sceneClips);
+    updateTimeRange();
 }
 
 function setStatus(msg) {
@@ -586,22 +587,37 @@ function render(timeMs) {
 
 let gui = null;
 let clipCtrl = null;
+let timeCtrl = null;
 let morphsFolder = null;
 const CLIP_PARAM = { clip: '' };
 
 function initGui() {
     gui = new lil.GUI();
     gui.add(PARAMS, 'asset', ASSETS).name('asset').onChange(loadModel);
-    gui.add(PARAMS, 'animate').name('play');
+    // Same order as the Three.js viewer's Animation folder: clip → play → time.
     clipCtrl = gui.add(CLIP_PARAM, 'clip', ['']).name('clip').onChange(name => {
         if (!scene) return;
         const idx = scene.clips.findIndex(c => c.name === name);
         if (idx >= 0) {
             scene.currentClip = idx;
             PARAMS.time = 0;
+            updateTimeRange();
         }
     });
     clipCtrl.hide();
+    gui.add(PARAMS, 'animate').name('play');
+    // Time scrubber. Updates automatically via .listen() while playing; when
+    // `play` is off, dragging the slider seeks to that time (the render loop
+    // only overwrites PARAMS.time when PARAMS.animate is true).
+    timeCtrl = gui.add(PARAMS, 'time', 0, 1, 0.01).name('time').listen();
+}
+
+// Resync the time slider's max to the current clip's duration. Called from
+// loadModel (after the scene is set) and from the clip dropdown's onChange.
+function updateTimeRange() {
+    if (!timeCtrl) return;
+    const dur = scene?.clips[scene.currentClip]?.duration ?? 0;
+    timeCtrl.max(dur > 0 ? dur : 1);
 }
 
 // Rebuild the "Morphs" folder from the loaded scene's meshes. One subfolder
@@ -656,6 +672,7 @@ function updateClipGui(clips) {
         if (idx >= 0) {
             scene.currentClip = idx;
             PARAMS.time = 0;
+            updateTimeRange();
         }
     });
     if (names.length > 1) clipCtrl.show();
