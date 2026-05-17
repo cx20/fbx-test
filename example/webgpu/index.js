@@ -23,33 +23,41 @@ const PARAMS = createParams();
 // =====================================================================
 
 let canvas, ctx, device, adapter;
-let pipeline, bindGroupLayout, sampler;
+let pipeline, meshBindGroupLayout, matBindGroupLayout, sampler;
 let depthTexture = null;
 let dummyTexture; // 1x1 white texture used as the diffuse for non-textured meshes
 let presentationFormat;
 
-// Uniform buffer layout matches the WGSL `Uniforms` struct in index.html.
+// Per-mesh uniform buffer layout matches the WGSL `MeshUniforms` struct.
 //   viewProj     (mat4 = 16 floats)
 //   model        (mat4 = 16 floats)
 //   normalMat    (mat4 = 16 floats)
-//   baseColor    (vec4 = 4 floats)
 //   lightDir     (vec4 = 4 floats)
 //   ambient      (vec4 = 4 floats)
 //   morphWeights (vec4 = 4 floats)
 //   flags        (vec4u = 4 u32) — same 16 bytes; written through Uint32 view
 //   bones        (array<mat4, 64> = 64 * 16 floats)
-const U_FLOAT_COUNT = 16 + 16 + 16 + 4 + 4 + 4 + 4 + 4 + 64 * 16;
+const U_FLOAT_COUNT = 16 + 16 + 16 + 4 + 4 + 4 + 4 + 64 * 16;
 const U_BYTES = U_FLOAT_COUNT * 4;
 const U_OFF = {
     viewProj:     0,
     model:        16,
     normalMat:    32,
-    baseColor:    48,
-    lightDir:     52,
-    ambient:      56,
-    morphWeights: 60,
-    flags:        64,
-    bones:        68,
+    lightDir:     48,
+    ambient:      52,
+    morphWeights: 56,
+    flags:        60,
+    bones:        64,
+};
+
+// Per-material uniform buffer layout matches the WGSL `MaterialUniforms` struct.
+//   baseColor (vec4 = 4 floats)
+//   flags     (vec4u = 4 u32) — written through Uint32 view
+const MAT_U_FLOAT_COUNT = 4 + 4;
+const MAT_U_BYTES = MAT_U_FLOAT_COUNT * 4;
+const MAT_U_OFF = {
+    baseColor: 0,
+    flags:     4,
 };
 
 async function initWebGPU() {
@@ -66,9 +74,14 @@ async function initWebGPU() {
     const code = document.getElementById('wgsl').textContent;
     const shaderModule = device.createShaderModule({ code });
 
-    bindGroupLayout = device.createBindGroupLayout({
+    meshBindGroupLayout = device.createBindGroupLayout({
         entries: [
             { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        ],
+    });
+    matBindGroupLayout = device.createBindGroupLayout({
+        entries: [
+            { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
             { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
             { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
         ],
@@ -89,7 +102,7 @@ async function initWebGPU() {
         ],
     });
     pipeline = device.createRenderPipeline({
-        layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+        layout: device.createPipelineLayout({ bindGroupLayouts: [meshBindGroupLayout, matBindGroupLayout] }),
         vertex: {
             module: shaderModule,
             entryPoint: 'vsMain',
@@ -192,18 +205,15 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors, geometri
     const colorsData  = readLayer('LayerElementColor',  'Colors',  'ColorIndex');
     const uvsData     = readLayer('LayerElementUV',     'UV',      'UVIndex');
 
-    // Per-polygon material index (when the FBX assigns multiple materials to
-    // a single mesh, e.g. Head_69 with 43 face materials). We only treat it
-    // as "multi-material" when the layer actually references more than one
-    // distinct material; AllSame / single-index cases fall back to the
-    // existing single-uBaseColor path.
+    // Per-polygon material index. The geometry can carry a LayerElementMaterial
+    // that assigns a material slot to each polygon (e.g. Head_69 with 43 slots,
+    // or morph-translation's paillottes whose 576 polygons split 50/50 between
+    // two textured materials). We bucket the polygon-corner indices by material
+    // index here so the renderer can issue one draw call per material with the
+    // matching baseColor / texture.
     const materialLayer = findNode(geoNode.children, 'LayerElementMaterial');
     const matsArrNode   = materialLayer ? findNode(materialLayer.children, 'Materials') : null;
-    const matMappingNode = materialLayer ? findNode(materialLayer.children, 'MappingInformationType') : null;
     const matsArr = matsArrNode?.props[0] ?? null;
-    const matMapping = matMappingNode?.props[0] ?? 'AllSame';
-    const useMatColors = materialColors && matsArr && matMapping === 'ByPolygon'
-        && new Set(matsArr).size > 1;
 
     function lookup(layer, stride, pvIdx, polyIdx, vIdx, fallback) {
         if (!layer) return fallback;
@@ -252,7 +262,7 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors, geometri
     const outBoneWt    = [];
     const morphCount   = morphDeltas ? morphDeltas.length : 0;
     const outMorphs    = morphDeltas ? morphDeltas.map(() => []) : [];
-    const outIndices   = [];
+    const indexBucket  = new Map(); // matIdx -> number[]
     let polyCornerStart = 0;
     let polyId = 0;
 
@@ -277,14 +287,8 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors, geometri
         } else {
             outNormals.push(n[0], n[1], n[2]);
         }
-        if (useMatColors) {
-            const mi = matsArr[polyId] ?? 0;
-            const mc = materialColors[mi] ?? [1, 1, 1];
-            outColors.push(mc[0], mc[1], mc[2], 1);
-        } else {
-            const c = lookup(colorsData, 4, i, polyId, v, [1, 1, 1, 1]);
-            outColors.push(c[0], c[1], c[2], c[3]);
-        }
+        const c = lookup(colorsData, 4, i, polyId, v, [1, 1, 1, 1]);
+        outColors.push(c[0], c[1], c[2], c[3]);
         const uv = lookup(uvsData, 2, i, polyId, v, [0, 0]);
         outUVs.push(uv[0], 1.0 - uv[1]); // FBX UV V=0 is top; WebGL V=0 is bottom
         if (skinPerVertex) {
@@ -305,12 +309,27 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors, geometri
         }
 
         if (isEnd) {
+            const matIdx = matsArr ? (matsArr[polyId] ?? 0) : 0;
+            let bucket = indexBucket.get(matIdx);
+            if (!bucket) { bucket = []; indexBucket.set(matIdx, bucket); }
             for (let j = polyCornerStart + 1; j < i; j++) {
-                outIndices.push(polyCornerStart, j, j + 1);
+                bucket.push(polyCornerStart, j, j + 1);
             }
             polyCornerStart = i + 1;
             polyId++;
         }
+    }
+
+    // Concatenate per-material index buckets into a single flat array; record
+    // each material's offset/count so the renderer can drawIndexed per group.
+    // Sort by matIdx for deterministic ordering.
+    const sortedKeys = [...indexBucket.keys()].sort((a, b) => a - b);
+    const allIndices = [];
+    const groups = [];
+    for (const matIdx of sortedKeys) {
+        const inds = indexBucket.get(matIdx);
+        groups.push({ matIdx, offset: allIndices.length, count: inds.length });
+        for (const idx of inds) allIndices.push(idx);
     }
 
     return {
@@ -321,9 +340,15 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors, geometri
         boneIndices: skinPerVertex ? new Float32Array(outBoneIdx) : null,
         boneWeights: skinPerVertex ? new Float32Array(outBoneWt)  : null,
         morphs:    outMorphs.map(a => new Float32Array(a)),
-        indices:   outIndices,               // plain number[] — converted to Uint16Array/Uint32Array in uploadMesh
-        triangleCount: outIndices.length / 3,
-        hasVertexColor: !!colorsData || useMatColors,
+        indices:   allIndices,               // plain number[] — converted to Uint16Array/Uint32Array in uploadMesh
+        groups,                              // [{ matIdx, offset, count }] — offsets/counts are in indices
+        triangleCount: allIndices.length / 3,
+        // LayerElementColor takes precedence ONLY when no LayerElementMaterial
+        // exists (e.g. vCube: rainbow vertex colors, no material). When the
+        // geometry has a material layer, the per-group baseColor wins so that
+        // stray vertex color data (e.g. Head_69's white/black LayerElementColor)
+        // does not overwrite the per-polygon material colors.
+        hasVertexColor: !!colorsData && !matsArr,
         hasUVs: !!uvsData,
         hasSkin: !!skinPerVertex,
     };
@@ -422,22 +447,17 @@ function uploadMesh(meshData) {
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    function makeBindGroup(textureView) {
-        return device.createBindGroup({
-            layout: bindGroupLayout,
-            entries: [
-                { binding: 0, resource: { buffer: uniformBuf } },
-                { binding: 1, resource: textureView },
-                { binding: 2, resource: sampler },
-            ],
-        });
-    }
-    const bindGroup = makeBindGroup(dummyTexture.createView());
+    const meshBindGroup = device.createBindGroup({
+        layout: meshBindGroupLayout,
+        entries: [
+            { binding: 0, resource: { buffer: uniformBuf } },
+        ],
+    });
 
     return {
         vb, idxBuf, idxFormat: needU32 ? 'uint32' : 'uint16',
-        count: meshData.indices.length,
-        uniformBuf, bindGroup, makeBindGroup,
+        groups: meshData.groups, // [{ matIdx, offset, count }]
+        uniformBuf, meshBindGroup,
         hasVertexColor: meshData.hasVertexColor,
         hasUVs: meshData.hasUVs,
         hasSkin: meshData.hasSkin,
@@ -833,15 +853,15 @@ async function loadModel(name) {
         return { name: stub.name, animationsOf, morphAnimsByChannel: new Map(), duration };
     });
 
-    // Trace Model→Material→Texture→Video to find the Video node for a mesh
-    function findVideoForModel(modelId) {
-        for (const matId of reverseConns.get(modelId) ?? []) {
-            if (!matById.has(matId)) continue;
-            for (const texId of reverseConns.get(matId) ?? []) {
-                if (!texById.has(texId)) continue;
-                for (const vidId of reverseConns.get(texId) ?? []) {
-                    if (vidById.has(vidId)) return vidById.get(vidId);
-                }
+    // Trace Material→Texture→Video to find the Video node for one material.
+    // Used to load per-material textures so meshes with multi-material textures
+    // (e.g. morph-translation's paillottes, paillotte.png + paillotte extremite.png)
+    // can render each material's polygons with the matching texture.
+    function findVideoForMaterial(matId) {
+        for (const texId of reverseConns.get(matId) ?? []) {
+            if (!texById.has(texId)) continue;
+            for (const vidId of reverseConns.get(texId) ?? []) {
+                if (vidById.has(vidId)) return vidById.get(vidId);
             }
         }
         return null;
@@ -875,22 +895,6 @@ async function loadModel(name) {
         return mats;
     }
 
-    // Pick the base color for a mesh when not using per-polygon material colors.
-    // A model can have multiple materials connected even when only one of them
-    // is actually used by the geometry — LayerElementMaterial.Materials tells
-    // us which one. morph-translation's 'Ampoules' is the canonical example:
-    // it connects [noir, ampoule, blanc] but every polygon uses index 1
-    // (ampoule, cream-white). Picking matColors[0] would render the bulbs in
-    // 'noir' (near-black); we want the index the geometry actually references.
-    function pickEffectiveColor(geoNode, matColors) {
-        if (matColors.length === 0) return null;
-        if (matColors.length === 1) return matColors[0];
-        const layer = findNode(geoNode.children, 'LayerElementMaterial');
-        const matsArr = layer ? prop0(findNode(layer.children, 'Materials')) : null;
-        if (!matsArr || matsArr.length === 0) return matColors[0];
-        return matColors[matsArr[0]] ?? matColors[0];
-    }
-
     // Build GPU objects for each mesh
     const meshes = [];
     let totalTriangles = 0;
@@ -921,26 +925,53 @@ async function loadModel(name) {
         const meshData = buildMesh(geoNode, skin, morphDeltas, matColors, geoXform);
         if (!meshData) continue;
         const gpu = uploadMesh(meshData);
-        let texture = null;
-        if (meshData.hasUVs) {
-            const vid = findVideoForModel(modelId);
-            if (vid) {
-                try {
-                    texture = await loadTextureFromVideo(vid, url);
-                    if (texture) {
-                        // Rebuild the bind group so binding 1 points at the
-                        // real texture rather than the 1x1 white fallback.
-                        gpu.bindGroup = gpu.makeBindGroup(texture.createView());
-                    }
-                } catch (e) { console.warn('Texture load failed:', e); }
-            }
-        }
-        const baseColor = pickEffectiveColor(geoNode, matColors);
+        // Load per-material textures so each draw call can bind the matching
+        // art. matsForModel[i] aligns with the matIdx in meshData.groups; null
+        // entries mean "no texture, fall back to baseColor".
+        const matTextures = await Promise.all(matsForModel.map(async (mat) => {
+            if (!meshData.hasUVs) return null;
+            const vid = findVideoForMaterial(mat.props[0]);
+            if (!vid) return null;
+            try { return await loadTextureFromVideo(vid, url); }
+            catch (e) { console.warn('Texture load failed:', e); return null; }
+        }));
+        // Build a per-material uniform buffer + bind group for each material
+        // index actually referenced by the geometry (one per group). Material
+        // colors and texture-presence are static after load, so we fill the
+        // uniform buffer here once instead of every frame.
+        const matBindings = gpu.groups.map(g => {
+            const buf = device.createBuffer({
+                size: MAT_U_BYTES,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            const tex = matTextures[g.matIdx] ?? dummyTexture;
+            const bindGroup = device.createBindGroup({
+                layout: matBindGroupLayout,
+                entries: [
+                    { binding: 0, resource: { buffer: buf } },
+                    { binding: 1, resource: tex.createView() },
+                    { binding: 2, resource: sampler },
+                ],
+            });
+            const bc = matColors[g.matIdx];
+            const data = new Float32Array(MAT_U_FLOAT_COUNT);
+            const flags = new Uint32Array(data.buffer);
+            data[MAT_U_OFF.baseColor    ] = bc ? bc[0] : 0.85;
+            data[MAT_U_OFF.baseColor + 1] = bc ? bc[1] : 0.85;
+            data[MAT_U_OFF.baseColor + 2] = bc ? bc[2] : 0.9;
+            data[MAT_U_OFF.baseColor + 3] = 1.0;
+            flags[MAT_U_OFF.flags    ] = matTextures[g.matIdx] ? 1 : 0;
+            flags[MAT_U_OFF.flags + 1] = 0;
+            flags[MAT_U_OFF.flags + 2] = 0;
+            flags[MAT_U_OFF.flags + 3] = 0;
+            device.queue.writeBuffer(buf, 0, data);
+            return { matIdx: g.matIdx, bindGroup };
+        });
         // Display name for the mesh (used by the per-channel morph GUI).
         const rawModelName = modelById.get(modelId)?.props[1] ?? '';
         const sep = rawModelName.indexOf('\x00');
         const modelName = sep >= 0 ? rawModelName.slice(0, sep) : rawModelName;
-        meshes.push({ gpu, texture, modelId, modelName, skin, morph, baseColor });
+        meshes.push({ gpu, matColors, matBindings, modelId, modelName, skin, morph });
         totalTriangles += meshData.triangleCount;
         if (skin) totalBones += skin.boneModelIds.length;
         if (morph) totalMorphs += morph.channels.length;
@@ -1027,7 +1058,6 @@ function render(timeMs) {
             if (scaleMat) mat4.multiply(model, scaleMat, model);
         }
         mat3.normalFromMat4(tmpNormal3, model);
-        const hasTexture = !!(mesh.texture && mesh.gpu.hasUVs);
 
         // ---- Fill the per-mesh uniform buffer ----
         U_DATA.set(viewProj, U_OFF.viewProj);
@@ -1037,18 +1067,13 @@ function render(timeMs) {
         for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
             U_DATA[U_OFF.normalMat + c * 4 + r] = tmpNormal3[c * 3 + r];
         }
-        const bc = mesh.baseColor;
-        U_DATA[U_OFF.baseColor    ] = bc ? bc[0] : 0.85;
-        U_DATA[U_OFF.baseColor + 1] = bc ? bc[1] : 0.85;
-        U_DATA[U_OFF.baseColor + 2] = bc ? bc[2] : 0.9;
-        U_DATA[U_OFF.baseColor + 3] = 1.0;
         U_DATA[U_OFF.lightDir    ] = 0.3;
         U_DATA[U_OFF.lightDir + 1] = 1.0;
         U_DATA[U_OFF.lightDir + 2] = 0.5;
         U_DATA[U_OFF.lightDir + 3] = 0.0;
         U_DATA[U_OFF.ambient]      = 0.25;
         U_FLAGS[U_OFF.flags    ] = mesh.gpu.hasVertexColor ? 1 : 0;
-        U_FLAGS[U_OFF.flags + 1] = hasTexture ? 1 : 0;
+        U_FLAGS[U_OFF.flags + 1] = 0;
         U_FLAGS[U_OFF.flags + 2] = isSkinned ? 1 : 0;
         U_FLAGS[U_OFF.flags + 3] = 0;
 
@@ -1105,10 +1130,19 @@ function render(timeMs) {
     });
     pass.setPipeline(pipeline);
     for (const mesh of scene.meshes) {
-        pass.setBindGroup(0, mesh.gpu.bindGroup);
+        pass.setBindGroup(0, mesh.gpu.meshBindGroup);
         for (let i = 0; i < mesh.gpu.vb.length; i++) pass.setVertexBuffer(i, mesh.gpu.vb[i]);
         pass.setIndexBuffer(mesh.gpu.idxBuf, mesh.gpu.idxFormat);
-        pass.drawIndexed(mesh.gpu.count);
+        // One draw call per material group. Each group rebinds its own bind
+        // group(1) (baseColor uniform + matching texture) so multi-material
+        // meshes (e.g. morph-translation's paillottes split between
+        // paillotte.png and paillotte_extremite.png) render with the right
+        // art per polygon.
+        for (let gi = 0; gi < mesh.gpu.groups.length; gi++) {
+            const g = mesh.gpu.groups[gi];
+            pass.setBindGroup(1, mesh.matBindings[gi].bindGroup);
+            pass.drawIndexed(g.count, 1, g.offset, 0, 0);
+        }
     }
     pass.end();
     device.queue.submit([enc.finish()]);
