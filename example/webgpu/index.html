@@ -93,11 +93,21 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
     let shade = ambientLight + vec3f(diffuse) * (1.0 - u.ambient.x);
     var base: vec4f;
     if (u.flags.y != 0u) {
-        base = textureSample(tex, samp, in.texCoord);
+        // Multiply the sampled texel by the material's diffuse color, matching
+        // Three.js / Babylon.js. Without this, meshes whose material carries a
+        // non-white DiffuseColor (e.g. morph-translation's paillotte at 0.5,0.5,0.5)
+        // render brighter than they should.
+        base = textureSample(tex, samp, in.texCoord) * u.baseColor;
     } else if (u.flags.x != 0u) {
         base = in.color;
     } else {
         base = u.baseColor;
+    }
+    // Alpha-test for textures with cut-out transparency (e.g. morph-translation's
+    // paillotte.png basket-weave). Cheaper than alpha blending and needs no depth
+    // sorting; for textures without true transparency, alpha is ~1 so this is a no-op.
+    if (u.flags.y != 0u && base.a < 0.5) {
+        discard;
     }
     return vec4f(base.rgb * shade, base.a);
 }

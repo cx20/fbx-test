@@ -86,12 +86,20 @@ void main() {
     vec3 shade = ambientLight + vec3(diffuse) * (1.0 - uAmbient);
     vec4 base;
     if (uHasTexture) {
-        base = texture2D(uTexture, vTexCoord);
+        // Multiply the sampled texel by the material's diffuse color, matching
+        // Three.js / Babylon.js. Without this, meshes whose material carries a
+        // non-white DiffuseColor (e.g. morph-translation's paillotte at 0.5,0.5,0.5)
+        // render brighter than they should.
+        base = texture2D(uTexture, vTexCoord) * uBaseColor;
     } else if (uHasVertexColor) {
         base = vColor;
     } else {
         base = uBaseColor;
     }
+    // Alpha-test for textures with cut-out transparency (e.g. morph-translation's
+    // paillotte.png basket-weave). Cheaper than alpha blending and needs no depth
+    // sorting; for textures without true transparency, alpha is ~1 so this is a no-op.
+    if (uHasTexture && base.a < 0.5) discard;
     gl_FragColor = vec4(base.rgb * shade, base.a);
 }
 </script>
