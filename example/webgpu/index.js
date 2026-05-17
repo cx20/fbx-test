@@ -270,7 +270,10 @@ function makeLocalMatrix(T, preR, R, S) {
 // material layer that references more than one material, the per-polygon
 // diffuse colors are baked into aColor / vColor — the cleanest way to render
 // multi-material meshes (e.g. Head_69) without splitting them into sub-meshes.
-function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors) {
+// If `geometricTransform` is provided ({ T, R, S }) it is baked into vertex
+// positions and normals here so skinned meshes (which skip the model matrix)
+// still pick it up.
+function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors, geometricTransform) {
     const verts = prop0(findNode(geoNode.children, 'Vertices'));
     const polyIdxNode = findNode(geoNode.children, 'PolygonVertexIndex');
     if (!verts || !polyIdxNode) return null;
@@ -325,6 +328,22 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors) {
         return out;
     }
 
+    // Bake the geometric transform into vertex positions / normals so skinned
+    // meshes (which don't see a model matrix in the shader) still pick it up.
+    let geoMat = null, geoNormMat = null;
+    if (geometricTransform) {
+        const { T = [0,0,0], R = [0,0,0], S = [1,1,1] } = geometricTransform;
+        const hasAny = T[0] || T[1] || T[2] || R[0] || R[1] || R[2]
+                     || S[0] !== 1 || S[1] !== 1 || S[2] !== 1;
+        if (hasAny) {
+            geoMat = makeLocalMatrix(T, null, R, S);
+            geoNormMat = mat3.create();
+            mat3.normalFromMat4(geoNormMat, geoMat);
+        }
+    }
+    const tmpPos = vec3.create();
+    const tmpNrm = vec3.create();
+
     const outPositions = [];
     const outNormals   = [];
     const outColors    = [];
@@ -342,9 +361,22 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors) {
         const isEnd = raw < 0;
         const v = isEnd ? ~raw : raw;
 
-        outPositions.push(verts[v * 3], verts[v * 3 + 1], verts[v * 3 + 2]);
+        if (geoMat) {
+            vec3.set(tmpPos, verts[v*3], verts[v*3+1], verts[v*3+2]);
+            vec3.transformMat4(tmpPos, tmpPos, geoMat);
+            outPositions.push(tmpPos[0], tmpPos[1], tmpPos[2]);
+        } else {
+            outPositions.push(verts[v * 3], verts[v * 3 + 1], verts[v * 3 + 2]);
+        }
         const n = lookup(normalsData, 3, i, polyId, v, [0, 0, 1]);
-        outNormals.push(n[0], n[1], n[2]);
+        if (geoNormMat) {
+            vec3.set(tmpNrm, n[0], n[1], n[2]);
+            vec3.transformMat3(tmpNrm, tmpNrm, geoNormMat);
+            vec3.normalize(tmpNrm, tmpNrm);
+            outNormals.push(tmpNrm[0], tmpNrm[1], tmpNrm[2]);
+        } else {
+            outNormals.push(n[0], n[1], n[2]);
+        }
         if (useMatColors) {
             const mi = matsArr[polyId] ?? 0;
             const mc = materialColors[mi] ?? [1, 1, 1];
@@ -910,13 +942,9 @@ function getWorldMatrix(leafModelId, time, scene) {
         mat4.multiply(world, world, makeLocalMatrix(trs.T, base.preR, trs.R, trs.S));
     }
 
-    // Apply geometric transform (fixed offset in local space, not animated)
-    const base = baseTRSOf.get(leafModelId);
-    if (base) {
-        const { geoT, geoR, geoS } = base;
-        const hasGeo = geoT.some(v => v !== 0) || geoR.some(v => v !== 0) || geoS.some(v => v !== 1);
-        if (hasGeo) mat4.multiply(world, world, makeLocalMatrix(geoT, null, geoR, geoS));
-    }
+    // GeometricTransform is baked into the mesh's vertex positions / normals
+    // at upload time (see buildMesh), so both skinned and non-skinned paths
+    // pick it up without applying it externally here.
 
     return world;
 }
@@ -1126,7 +1154,9 @@ async function loadModel(name) {
         const morphDeltas = morph ? morph.channels.map(ch => ch.deltas) : null;
         const matsForModel = findMaterialsForModel(modelId);
         const matColors = matsForModel.map(m => readMaterialColor(m) ?? [1, 1, 1]);
-        const meshData = buildMesh(geoNode, skin, morphDeltas, matColors);
+        const baseTRS = baseTRSOf.get(modelId);
+        const geoXform = baseTRS ? { T: baseTRS.geoT, R: baseTRS.geoR, S: baseTRS.geoS } : null;
+        const meshData = buildMesh(geoNode, skin, morphDeltas, matColors, geoXform);
         if (!meshData) continue;
         const gpu = uploadMesh(meshData);
         let texture = null;
