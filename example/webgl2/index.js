@@ -187,7 +187,7 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors, geometri
 
     // Bake the geometric transform into vertex positions / normals so skinned
     // meshes (which don't see a model matrix) also pick it up.
-    let geoMat = null, geoNormMat = null;
+    let geoMat = null, geoNormMat = null, geoDeltaMat = null;
     if (geometricTransform) {
         const { T = [0,0,0], R = [0,0,0], S = [1,1,1] } = geometricTransform;
         const hasAny = T[0] || T[1] || T[2] || R[0] || R[1] || R[2]
@@ -196,10 +196,18 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors, geometri
             geoMat = makeLocalMatrix(T, null, R, S);
             geoNormMat = mat3.create();
             mat3.normalFromMat4(geoNormMat, geoMat);
+            // Morph deltas are direction vectors (per-vertex offsets in object space).
+            // We bake the rotation+scale part of geoMat into them so they stay aligned
+            // with the already-baked vertex positions; translation must not be applied
+            // to a direction. morph-translation.fbx has GeometricRotation=(-180,0,0)
+            // on most meshes — without this, the slider moved verts the wrong way.
+            geoDeltaMat = mat3.create();
+            mat3.fromMat4(geoDeltaMat, geoMat);
         }
     }
     const tmpPos = vec3.create();
     const tmpNrm = vec3.create();
+    const tmpDlt = vec3.create();
 
     const outPositions = [];
     const outNormals   = [];
@@ -252,7 +260,13 @@ function buildMesh(geoNode, skinPerVertex, morphDeltas, materialColors, geometri
         }
         for (let m = 0; m < morphCount; m++) {
             const d = morphDeltas[m];
-            outMorphs[m].push(d[v*3], d[v*3+1], d[v*3+2]);
+            if (geoDeltaMat) {
+                vec3.set(tmpDlt, d[v*3], d[v*3+1], d[v*3+2]);
+                vec3.transformMat3(tmpDlt, tmpDlt, geoDeltaMat);
+                outMorphs[m].push(tmpDlt[0], tmpDlt[1], tmpDlt[2]);
+            } else {
+                outMorphs[m].push(d[v*3], d[v*3+1], d[v*3+2]);
+            }
         }
 
         if (isEnd) {
@@ -776,14 +790,20 @@ async function loadModel(name) {
         return mats;
     }
 
-    // First Material's diffuse color (used when the mesh isn't multi-material).
-    function findMaterialColorForModel(modelId) {
-        const mats = findMaterialsForModel(modelId);
-        for (const m of mats) {
-            const c = readMaterialColor(m);
-            if (c) return c;
-        }
-        return null;
+    // Pick the base color for a mesh when not using per-polygon material colors.
+    // A model can have multiple materials connected even when only one of them
+    // is actually used by the geometry — LayerElementMaterial.Materials tells
+    // us which one. morph-translation's 'Ampoules' is the canonical example:
+    // it connects [noir, ampoule, blanc] but every polygon uses index 1
+    // (ampoule, cream-white). Picking matColors[0] would render the bulbs in
+    // 'noir' (near-black); we want the index the geometry actually references.
+    function pickEffectiveColor(geoNode, matColors) {
+        if (matColors.length === 0) return null;
+        if (matColors.length === 1) return matColors[0];
+        const layer = findNode(geoNode.children, 'LayerElementMaterial');
+        const matsArr = layer ? prop0(findNode(layer.children, 'Materials')) : null;
+        if (!matsArr || matsArr.length === 0) return matColors[0];
+        return matColors[matsArr[0]] ?? matColors[0];
     }
 
     // Build GPU objects for each mesh
@@ -824,7 +844,7 @@ async function loadModel(name) {
                 catch (e) { console.warn('Texture load failed:', e); }
             }
         }
-        const baseColor = findMaterialColorForModel(modelId);
+        const baseColor = pickEffectiveColor(geoNode, matColors);
         // Display name for the mesh (used by the per-channel morph GUI).
         const rawModelName = modelById.get(modelId)?.props[1] ?? '';
         const sep = rawModelName.indexOf('\x00');
