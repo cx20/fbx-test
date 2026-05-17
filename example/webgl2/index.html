@@ -76,8 +76,15 @@ out vec4 fragColor;
 
 void main() {
     vec3 N = normalize(vNormal);
+    // Hemisphere ambient: bright top (sky), dim bottom (ground). Matches the
+    // softer hemispheric lighting that Three.js / Babylon.js use, so meshes
+    // like Samba Dancing don't render visibly darker than in those viewers.
+    float hemi = N.y * 0.5 + 0.5;
+    vec3 skyColor    = vec3(1.0);
+    vec3 groundColor = vec3(0.4);
+    vec3 ambientLight = mix(groundColor, skyColor, hemi);
     float diffuse = max(dot(N, normalize(uLightDir)), 0.0);
-    float shade = uAmbient + (1.0 - uAmbient) * diffuse;
+    vec3 shade = ambientLight + vec3(diffuse) * (1.0 - uAmbient);
     vec4 base;
     if (uHasTexture) {
         base = texture(uTexture, vTexCoord);
