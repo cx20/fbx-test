@@ -84,6 +84,7 @@ function createParams() {
         time:     Number(sp.get('time')) || 0,
         morph:    Number(sp.get('morph')) || 0,
         clip:     sp.get('clip') ?? null, // honored once on first load
+        skeleton: getBoolParam(sp, 'skeleton', false),
     };
 }
 

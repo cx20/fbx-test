@@ -16,6 +16,7 @@ const {
 } = window.FBXScene;
 
 const PARAMS = createParams();
+PARAMS.skeleton ??= /^(1|true|yes|on)$/i.test(new URLSearchParams(location.search).get('skeleton') ?? '');
 
 // =====================================================================
 // WebGL setup
@@ -23,6 +24,7 @@ const PARAMS = createParams();
 
 let canvas, gl;
 let program, attribs, uniforms;
+let skeletonProgram, skeletonAttribs, skeletonUniforms;
 
 function createShader(type, source) {
     const shader = gl.createShader(type);
@@ -84,6 +86,13 @@ function initGL() {
         bones:           gl.getUniformLocation(program, 'uBones'),
         morphWeights:    gl.getUniformLocation(program, 'uMorphWeights'),
     };
+
+    skeletonProgram = createProgram(
+        'attribute vec3 aPosition; uniform mat4 uViewProj; void main() { gl_Position = uViewProj * vec4(aPosition, 1.0); }',
+        'precision mediump float; void main() { gl_FragColor = vec4(1.0, 0.08, 0.04, 1.0); }',
+    );
+    skeletonAttribs = { position: gl.getAttribLocation(skeletonProgram, 'aPosition') };
+    skeletonUniforms = { viewProj: gl.getUniformLocation(skeletonProgram, 'uViewProj') };
 
     gl.clearColor(0.627, 0.627, 0.627, 1.0);
     gl.enable(gl.DEPTH_TEST);
@@ -236,6 +245,76 @@ const cameraUp     = vec3.fromValues(0, 1, 0);
 
 // Camera controls live in example/common/orbit-controls.js and are wired up
 // in main() after the canvas has been created.
+
+function buildSkeletonSegments(skins, parentOf) {
+    const segments = [];
+    const seen = new Set();
+    const seenSkins = new Set();
+
+    for (const skin of skins) {
+        const skinKey = skin.boneModelIds.join('|');
+        if (seenSkins.has(skinKey)) continue;
+        seenSkins.add(skinKey);
+
+        const boneIds = new Set(skin.boneModelIds);
+        for (const boneId of skin.boneModelIds) {
+            let parentId = parentOf.get(boneId);
+            while (parentId !== undefined && !boneIds.has(parentId)) parentId = parentOf.get(parentId);
+            if (parentId === undefined) continue;
+
+            const key = `${parentId}:${boneId}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            segments.push({ parentId, childId: boneId });
+        }
+    }
+
+    return segments;
+}
+
+function createSkeletonGpu(segments) {
+    if (!segments.length) return null;
+    const positions = new Float32Array(segments.length * 6);
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, positions.byteLength, gl.DYNAMIC_DRAW);
+    return { segments, positions, buffer };
+}
+
+function updateSkeletonGpu() {
+    const skeleton = scene?.skeleton;
+    if (!skeleton || !PARAMS.skeleton) return;
+
+    for (let i = 0; i < skeleton.segments.length; i++) {
+        const segment = skeleton.segments[i];
+        const parentWorld = getWorldMatrix(segment.parentId, PARAMS.time, scene);
+        const childWorld = getWorldMatrix(segment.childId, PARAMS.time, scene);
+        const offset = i * 6;
+        skeleton.positions[offset] = parentWorld[12] * scene.scale;
+        skeleton.positions[offset + 1] = parentWorld[13] * scene.scale;
+        skeleton.positions[offset + 2] = parentWorld[14] * scene.scale;
+        skeleton.positions[offset + 3] = childWorld[12] * scene.scale;
+        skeleton.positions[offset + 4] = childWorld[13] * scene.scale;
+        skeleton.positions[offset + 5] = childWorld[14] * scene.scale;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, skeleton.buffer);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, skeleton.positions);
+}
+
+function renderSkeleton() {
+    const skeleton = scene?.skeleton;
+    if (!skeleton || !PARAMS.skeleton) return;
+
+    updateSkeletonGpu();
+    gl.useProgram(skeletonProgram);
+    gl.uniformMatrix4fv(skeletonUniforms.viewProj, false, viewProj);
+    gl.disable(gl.DEPTH_TEST);
+    gl.bindBuffer(gl.ARRAY_BUFFER, skeleton.buffer);
+    gl.enableVertexAttribArray(skeletonAttribs.position);
+    gl.vertexAttribPointer(skeletonAttribs.position, 3, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.LINES, 0, skeleton.segments.length * 2);
+    gl.enable(gl.DEPTH_TEST);
+}
 
 async function loadModel(name) {
     if (!ASSETS.includes(name)) return;
@@ -390,6 +469,7 @@ async function loadModel(name) {
     let totalTriangles = 0;
     let totalBones = 0;
     let totalMorphs = 0;
+    const skins = [];
     for (const { geoNode, modelId } of meshPairs) {
         const verts = prop0(findNode(geoNode.children, 'Vertices'));
         const vertexCount = verts ? verts.length / 3 : 0;
@@ -436,6 +516,7 @@ async function loadModel(name) {
         const sep = rawModelName.indexOf('\x00');
         const modelName = sep >= 0 ? rawModelName.slice(0, sep) : rawModelName;
         meshes.push({ gpu, matColors, matTextures, modelId, modelName, skin, morph });
+        if (skin) skins.push(skin);
         totalTriangles += meshData.triangleCount;
         if (skin) totalBones += skin.boneModelIds.length;
         if (morph) totalMorphs += morph.channels.length;
@@ -451,6 +532,7 @@ async function loadModel(name) {
         meshes, parentOf, modelById, baseTRSOf,
         clips: sceneClips, currentClip: 0,
         modelName: name, scale,
+        skeleton: createSkeletonGpu(buildSkeletonSegments(skins, parentOf)),
     };
     const skinNote  = totalBones  ? ` — bones: ${totalBones}`   : '';
     const morphNote = totalMorphs ? ` — morphs: ${totalMorphs}` : '';
@@ -610,6 +692,8 @@ function render(timeMs) {
         }
     }
 
+    renderSkeleton();
+
     requestAnimationFrame(render);
 }
 
@@ -638,6 +722,7 @@ function initGui() {
     });
     clipCtrl.hide();
     gui.add(PARAMS, 'animate').name('play');
+    gui.add(PARAMS, 'skeleton').name('skeleton');
     // Time scrubber. Updates automatically via .listen() while playing; when
     // `play` is off, dragging the slider seeks to that time (the render loop
     // only overwrites PARAMS.time when PARAMS.animate is true).
