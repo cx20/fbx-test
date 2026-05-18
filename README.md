@@ -6,6 +6,7 @@ The status of loading and viewing FBX models using different WebGL libraries.
 
 - [Three.js + FBXLoader](https://cx20.github.io/fbx-test/example/threejs/index.html)
 - [Babylon.js + custom FBX loader](https://cx20.github.io/fbx-test/example/babylonjs/index.html)
+- [PlayCanvas + FBX parser](https://cx20.github.io/fbx-test/example/playcanvas/index.html)
 - [WebGL 1.0 + FBX parser](https://cx20.github.io/fbx-test/example/webgl1/index.html)
 - [WebGL 2.0 + FBX parser](https://cx20.github.io/fbx-test/example/webgl2/index.html)
 - [WebGPU + FBX parser](https://cx20.github.io/fbx-test/example/webgpu/index.html)
