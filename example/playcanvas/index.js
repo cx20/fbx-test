@@ -14,6 +14,7 @@ const CUSTOM_URL_OPTION = '__custom_url__';
 const PARAMS = {
     ...createParams(),
     asset: getInitialSelection(),
+    skeleton: getBoolParam('skeleton', false),
     ground: getBoolParam('ground', true),
     rotate: getBoolParam('rotate', false),
 };
@@ -22,6 +23,7 @@ let app, canvas, camera, light, ground;
 let gui, assetController, clipController, timeController, morphsFolder;
 let modelRoot = null;
 let currentScene = null;
+let skeletonHelper = null;
 let isLoading = false;
 let resources = [];
 
@@ -90,6 +92,7 @@ function getInitialClipName() {
 }
 
 function disposeCurrentModel() {
+    disposeSkeletonHelper();
     if (modelRoot) {
         modelRoot.destroy();
         modelRoot = null;
@@ -97,6 +100,14 @@ function disposeCurrentModel() {
     resources.forEach(resource => resource?.destroy?.());
     resources = [];
     currentScene = null;
+}
+
+function disposeSkeletonHelper() {
+    if (!skeletonHelper) return;
+    skeletonHelper.entity.destroy();
+    skeletonHelper.mesh?.destroy?.();
+    skeletonHelper.material?.destroy?.();
+    skeletonHelper = null;
 }
 
 function createMaterial(color, texture, hasVertexColor, track = true) {
@@ -248,6 +259,98 @@ function createSkinInstance(skinResource) {
     const skinInstance = new pc.SkinInstance(skinResource.skin);
     skinInstance.bones = skinResource.bones;
     return skinInstance;
+}
+
+function buildSkeletonSegments(skins, entityById, parentOf) {
+    const segments = [];
+    const seen = new Set();
+    const seenSkins = new Set();
+
+    for (const skin of skins) {
+        const skinKey = skin.boneModelIds.join('|');
+        if (seenSkins.has(skinKey)) continue;
+        seenSkins.add(skinKey);
+
+        const boneIds = new Set(skin.boneModelIds);
+        for (const boneId of skin.boneModelIds) {
+            let parentId = parentOf.get(boneId);
+            while (parentId !== undefined && !boneIds.has(parentId)) parentId = parentOf.get(parentId);
+            if (parentId === undefined) continue;
+
+            const parent = entityById.get(parentId);
+            const child = entityById.get(boneId);
+            if (!parent || !child) continue;
+
+            const segmentKey = `${parentId}:${boneId}`;
+            if (seen.has(segmentKey)) continue;
+            seen.add(segmentKey);
+            segments.push({ parent, child });
+        }
+    }
+
+    return segments;
+}
+
+function createSkeletonHelper(segments) {
+    disposeSkeletonHelper();
+    if (!segments.length) return;
+
+    const positions = new Float32Array(segments.length * 6);
+    const indices = new Uint16Array(segments.length * 2);
+    for (let i = 0; i < indices.length; i++) indices[i] = i;
+
+    const mesh = new pc.Mesh(app.graphicsDevice);
+    mesh.setPositions(positions);
+    mesh.setIndices(indices);
+    mesh.update(pc.PRIMITIVE_LINES);
+
+    const material = new pc.StandardMaterial();
+    material.diffuse = new pc.Color(1, 0.08, 0.04);
+    material.emissive = new pc.Color(1, 0.08, 0.04);
+    material.blendType = pc.BLEND_NORMAL;
+    material.useLighting = false;
+    material.depthTest = false;
+    material.depthFunc = pc.FUNC_ALWAYS;
+    material.depthWrite = false;
+    material.update();
+
+    const entity = new pc.Entity('skeleton');
+    const meshInstance = new pc.MeshInstance(mesh, material, entity);
+    meshInstance.cull = false;
+    entity.addComponent('render', {
+        meshInstances: [meshInstance],
+    });
+    entity.enabled = PARAMS.skeleton;
+    app.root.addChild(entity);
+
+    skeletonHelper = { entity, mesh, material, positions, segments };
+    updateSkeletonHelper();
+}
+
+function updateSkeletonHelper() {
+    if (!skeletonHelper) return;
+    skeletonHelper.entity.enabled = PARAMS.skeleton;
+    if (!PARAMS.skeleton) return;
+
+    const { positions, segments } = skeletonHelper;
+    for (let i = 0; i < segments.length; i++) {
+        const parent = segments[i].parent.getPosition();
+        const child = segments[i].child.getPosition();
+        const offset = i * 6;
+        positions[offset] = parent.x;
+        positions[offset + 1] = parent.y;
+        positions[offset + 2] = parent.z;
+        positions[offset + 3] = child.x;
+        positions[offset + 4] = child.y;
+        positions[offset + 5] = child.z;
+    }
+    skeletonHelper.mesh.setPositions(positions);
+    skeletonHelper.mesh.update(pc.PRIMITIVE_LINES);
+}
+
+function setSceneVisibility() {
+    if (ground) ground.enabled = PARAMS.ground;
+    if (skeletonHelper) skeletonHelper.entity.enabled = PARAMS.skeleton;
 }
 
 function createMorphResource(meshData, fbxMorph) {
@@ -435,6 +538,7 @@ async function loadModel(selection) {
         let totalSkinnedMeshes = 0;
         let totalMorphs = 0;
         const morphMeshes = [];
+        const skinRecords = [];
 
         for (const { geoNode, modelId } of meshPairs) {
             const verts = prop0(findNode(geoNode.children, 'Vertices'));
@@ -474,6 +578,7 @@ async function loadModel(selection) {
             if (!meshData) continue;
             const skinResource = createSkinResource(skin, entityById);
             const morphResource = createMorphResource(meshData, morph);
+            if (skin) skinRecords.push(skin);
 
             const textures = await Promise.all(matsForModel.map(async mat => {
                 if (!meshData.hasUVs) return null;
@@ -515,6 +620,7 @@ async function loadModel(selection) {
             baseTRSOf,
             morphMeshes,
         };
+        createSkeletonHelper(buildSkeletonSegments(skinRecords, entityById, parentOf));
         selectInitialClip();
         rebuildClipGui(currentScene.clips);
         rebuildMorphsFolder(morphMeshes);
@@ -652,6 +758,7 @@ function updateAnimation(dt) {
         setEntityTransform(entity, base, clip.animationsOf.get(id), PARAMS.time);
     }
     updateMorphWeights(clip);
+    updateSkeletonHelper();
 }
 
 function updateCamera() {
@@ -709,8 +816,9 @@ function initGui() {
     gui = new lil.GUI();
     assetController = gui.add(PARAMS, 'asset', getAssetOptions()).name('asset').onChange(loadModel);
     gui.add(PARAMS, 'animate').name('play');
+    gui.add(PARAMS, 'skeleton').name('skeleton').onChange(setSceneVisibility);
     gui.add(PARAMS, 'rotate').name('rotate');
-    gui.add(PARAMS, 'ground').name('ground').onChange(value => { ground.enabled = value; });
+    gui.add(PARAMS, 'ground').name('ground').onChange(setSceneVisibility);
 }
 
 function initScene() {

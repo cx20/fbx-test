@@ -9,7 +9,7 @@
 (() => {
 
 const { parseFBX, findNode, findNodes, prop0 } = window.FBXParser;
-const { mat4, mat3, vec3 } = window.glMatrix;
+const { mat4, mat3, vec3, vec4 } = window.glMatrix;
 const {
     ASSETS, FBX_BASE, MAX_BONES, MAX_MORPHS, SCALES, modelUrl, createParams,
     getProps70, eulerToMat4, makeLocalMatrix,
@@ -18,13 +18,14 @@ const {
 } = window.FBXScene;
 
 const PARAMS = createParams();
+PARAMS.skeleton ??= /^(1|true|yes|on)$/i.test(new URLSearchParams(location.search).get('skeleton') ?? '');
 
 // =====================================================================
 // WebGPU setup
 // =====================================================================
 
 let canvas, ctx, device, adapter;
-let pipeline, meshBindGroupLayout, matBindGroupLayout, sampler;
+let pipeline, skeletonPipeline, meshBindGroupLayout, matBindGroupLayout, sampler;
 let depthTexture = null;
 let dummyTexture; // 1x1 white texture used as the diffuse for non-textured meshes
 let presentationFormat;
@@ -125,6 +126,38 @@ async function initWebGPU() {
         },
         primitive: { topology: 'triangle-list', cullMode: 'back' },
         depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+
+    const skeletonShaderModule = device.createShaderModule({
+        code: `
+            struct VsOut {
+                @builtin(position) pos: vec4f,
+            };
+            @vertex fn vsMain(@location(0) position: vec4f) -> VsOut {
+                var out: VsOut;
+                out.pos = position;
+                return out;
+            }
+            @fragment fn fsMain() -> @location(0) vec4f {
+                return vec4f(1.0, 0.08, 0.04, 1.0);
+            }
+        `,
+    });
+
+    skeletonPipeline = device.createRenderPipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [] }),
+        vertex: {
+            module: skeletonShaderModule,
+            entryPoint: 'vsMain',
+            buffers: [{ arrayStride: 16, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] }],
+        },
+        fragment: {
+            module: skeletonShaderModule,
+            entryPoint: 'fsMain',
+            targets: [{ format: presentationFormat }],
+        },
+        primitive: { topology: 'line-list' },
+        depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'always' },
     });
 
     sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat' });
@@ -333,6 +366,65 @@ const cameraUp     = vec3.fromValues(0, 1, 0);
 // Camera controls live in example/common/orbit-controls.js and are wired up
 // in main() after the canvas has been created.
 
+function buildSkeletonSegments(skins, parentOf) {
+    const segments = [];
+    const seen = new Set();
+    const seenSkins = new Set();
+
+    for (const skin of skins) {
+        const skinKey = skin.boneModelIds.join('|');
+        if (seenSkins.has(skinKey)) continue;
+        seenSkins.add(skinKey);
+
+        const boneIds = new Set(skin.boneModelIds);
+        for (const boneId of skin.boneModelIds) {
+            let parentId = parentOf.get(boneId);
+            while (parentId !== undefined && !boneIds.has(parentId)) parentId = parentOf.get(parentId);
+            if (parentId === undefined) continue;
+
+            const key = `${parentId}:${boneId}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            segments.push({ parentId, childId: boneId });
+        }
+    }
+
+    return segments;
+}
+
+function createSkeletonGpu(segments) {
+    if (!segments.length) return null;
+    const positions = new Float32Array(segments.length * 8);
+    const buffer = device.createBuffer({
+        size: positions.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    return { segments, positions, buffer };
+}
+
+function updateSkeletonGpu() {
+    const skeleton = scene?.skeleton;
+    if (!skeleton || !PARAMS.skeleton) return;
+
+    const clipPosition = vec4.create();
+    const worldPosition = vec4.create();
+    for (let i = 0; i < skeleton.segments.length; i++) {
+        const segment = skeleton.segments[i];
+        const parentWorld = getWorldMatrix(segment.parentId, PARAMS.time, scene);
+        const childWorld = getWorldMatrix(segment.childId, PARAMS.time, scene);
+        const offset = i * 8;
+
+        vec4.set(worldPosition, parentWorld[12] * scene.scale, parentWorld[13] * scene.scale, parentWorld[14] * scene.scale, 1);
+        vec4.transformMat4(clipPosition, worldPosition, viewProj);
+        skeleton.positions.set(clipPosition, offset);
+
+        vec4.set(worldPosition, childWorld[12] * scene.scale, childWorld[13] * scene.scale, childWorld[14] * scene.scale, 1);
+        vec4.transformMat4(clipPosition, worldPosition, viewProj);
+        skeleton.positions.set(clipPosition, offset + 4);
+    }
+    device.queue.writeBuffer(skeleton.buffer, 0, skeleton.positions);
+}
+
 async function loadModel(name) {
     if (!ASSETS.includes(name)) return;
     setStatus(`Loading ${name} ...`);
@@ -486,6 +578,7 @@ async function loadModel(name) {
     let totalTriangles = 0;
     let totalBones = 0;
     let totalMorphs = 0;
+    const skins = [];
     for (const { geoNode, modelId } of meshPairs) {
         const verts = prop0(findNode(geoNode.children, 'Vertices'));
         const vertexCount = verts ? verts.length / 3 : 0;
@@ -558,6 +651,7 @@ async function loadModel(name) {
         const sep = rawModelName.indexOf('\x00');
         const modelName = sep >= 0 ? rawModelName.slice(0, sep) : rawModelName;
         meshes.push({ gpu, matColors, matBindings, modelId, modelName, skin, morph });
+        if (skin) skins.push(skin);
         totalTriangles += meshData.triangleCount;
         if (skin) totalBones += skin.boneModelIds.length;
         if (morph) totalMorphs += morph.channels.length;
@@ -573,6 +667,7 @@ async function loadModel(name) {
         meshes, parentOf, modelById, baseTRSOf,
         clips: sceneClips, currentClip: 0,
         modelName: name, scale,
+        skeleton: createSkeletonGpu(buildSkeletonSegments(skins, parentOf)),
     };
     const skinNote  = totalBones  ? ` — bones: ${totalBones}`   : '';
     const morphNote = totalMorphs ? ` — morphs: ${totalMorphs}` : '';
@@ -630,6 +725,7 @@ function render(timeMs) {
     mat4.perspectiveZO(projection, 45 * Math.PI / 180, aspect, 1, 2000);
     mat4.lookAt(view, cameraEye, cameraTarget, cameraUp);
     mat4.multiply(viewProj, projection, view);
+    updateSkeletonGpu();
 
     const scaleMat = scene.scale !== 1 ? mat4.fromScaling(mat4.create(), [scene.scale, scene.scale, scene.scale]) : null;
     const tmpNormal3 = mat3.create();
@@ -731,6 +827,11 @@ function render(timeMs) {
             pass.drawIndexed(g.count, 1, g.offset, 0, 0);
         }
     }
+    if (PARAMS.skeleton && scene.skeleton) {
+        pass.setPipeline(skeletonPipeline);
+        pass.setVertexBuffer(0, scene.skeleton.buffer);
+        pass.draw(scene.skeleton.segments.length * 2, 1, 0, 0);
+    }
     pass.end();
     device.queue.submit([enc.finish()]);
 
@@ -762,6 +863,7 @@ function initGui() {
     });
     clipCtrl.hide();
     gui.add(PARAMS, 'animate').name('play');
+    gui.add(PARAMS, 'skeleton').name('skeleton');
     // Time scrubber. Updates automatically via .listen() while playing; when
     // `play` is off, dragging the slider seeks to that time (the render loop
     // only overwrites PARAMS.time when PARAMS.animate is true).
