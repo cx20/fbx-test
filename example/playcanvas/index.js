@@ -19,7 +19,7 @@ const PARAMS = {
 };
 
 let app, canvas, camera, light, ground;
-let gui, assetController, clipController, timeController;
+let gui, assetController, clipController, timeController, morphsFolder;
 let modelRoot = null;
 let currentScene = null;
 let isLoading = false;
@@ -250,6 +250,16 @@ function createSkinInstance(skinResource) {
     return skinInstance;
 }
 
+function createMorphResource(meshData, fbxMorph) {
+    if (!fbxMorph || !meshData.morphs.length) return null;
+    const targets = meshData.morphs.map((deltaPositions, index) => new pc.MorphTarget({
+        name: fbxMorph.channels[index]?.name || `channel_${index}`,
+        deltaPositions,
+        defaultWeight: PARAMS.morph,
+    }));
+    return new pc.Morph(targets, app.graphicsDevice);
+}
+
 function setEntityTransform(entity, base, anim, time) {
     const trs = sampleAnimation(anim ?? null, time, base);
     const rotation = new pc.Quat();
@@ -334,6 +344,7 @@ async function loadModel(selection) {
     try {
         disposeCurrentModel();
         rebuildClipGui([]);
+        rebuildMorphsFolder([]);
 
         const buffer = await fetch(url).then(response => {
             if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -423,13 +434,22 @@ async function loadModel(selection) {
         let totalTriangles = 0;
         let totalSkinnedMeshes = 0;
         let totalMorphs = 0;
+        const morphMeshes = [];
 
         for (const { geoNode, modelId } of meshPairs) {
             const verts = prop0(findNode(geoNode.children, 'Vertices'));
             const vertexCount = verts ? verts.length / 3 : 0;
             const skin = buildSkinForGeometry(geoNode, vertexCount, connsNode, deformerById, modelById);
             const morph = buildMorphForGeometry(geoNode, vertexCount, connsNode, geoById, deformerById);
+            let morphRecord = null;
             if (morph) {
+                morphRecord = {
+                    modelId,
+                    modelName: makeEntityName(modelById.get(modelId), `model_${modelId}`),
+                    morph,
+                    instances: [],
+                };
+                morphMeshes.push(morphRecord);
                 for (const channel of morph.channels) {
                     for (let i = 0; i < clipStubs.length; i++) {
                         const anim = buildMorphAnimation(nodes, channel.channelId, clipStubs[i].acns);
@@ -447,12 +467,13 @@ async function loadModel(selection) {
             const meshData = buildMesh(
                 geoNode,
                 skin,
-                null,
+                morph ? morph.channels.map(channel => channel.deltas) : null,
                 matColors,
                 base ? { T: base.geoT, R: base.geoR, S: base.geoS } : null,
             );
             if (!meshData) continue;
             const skinResource = createSkinResource(skin, entityById);
+            const morphResource = createMorphResource(meshData, morph);
 
             const textures = await Promise.all(matsForModel.map(async mat => {
                 if (!meshData.hasUVs) return null;
@@ -467,8 +488,13 @@ async function loadModel(selection) {
                 const material = createMaterial(matColors[group.matIdx] ?? [0.85, 0.85, 0.9], textures[group.matIdx], meshData.hasVertexColor);
                 const mesh = createMesh(meshData, group);
                 if (skinResource) mesh.skin = skinResource.skin;
+                if (morphResource) mesh.morph = morphResource;
                 const meshInstance = new pc.MeshInstance(mesh, material, entity);
                 meshInstance.skinInstance = createSkinInstance(skinResource);
+                if (morphResource) {
+                    meshInstance.morphInstance = new pc.MorphInstance(morphResource);
+                    morphRecord.instances.push(meshInstance.morphInstance);
+                }
                 meshInstance.castShadow = true;
                 return meshInstance;
             });
@@ -487,9 +513,11 @@ async function loadModel(selection) {
             currentClip: 0,
             entityById,
             baseTRSOf,
+            morphMeshes,
         };
         selectInitialClip();
         rebuildClipGui(currentScene.clips);
+        rebuildMorphsFolder(morphMeshes);
         const renderBounds = getRenderBounds(modelRoot) ?? bounds;
         frameModel(renderBounds);
         PARAMS.asset = selection;
@@ -497,7 +525,7 @@ async function loadModel(selection) {
 
         const duration = currentScene.clips[currentScene.currentClip]?.duration ?? 0;
         const skinNote = totalSkinnedMeshes ? ` - skinned meshes: ${totalSkinnedMeshes}` : '';
-        const morphNote = totalMorphs ? ` - morphs: ${totalMorphs} (static)` : '';
+        const morphNote = totalMorphs ? ` - morphs: ${totalMorphs}` : '';
         setStatus(`${name} - triangles: ${totalTriangles}${duration ? ` - anim ${duration.toFixed(2)}s` : ''}${skinNote}${morphNote}`);
     } catch (err) {
         console.error(err);
@@ -573,12 +601,45 @@ function rebuildClipGui(clips) {
     timeController = gui.add(PARAMS, 'time', 0, Math.max(clips[currentScene?.currentClip ?? 0]?.duration ?? 0, 1), 0.01).name('time').listen();
 }
 
+function rebuildMorphsFolder(morphMeshes) {
+    if (!gui) return;
+    if (morphsFolder) {
+        morphsFolder.destroy();
+        morphsFolder = null;
+    }
+
+    const targets = morphMeshes.filter(mesh => mesh.morph?.channels.length > 0);
+    if (!targets.length) return;
+
+    morphsFolder = gui.addFolder('Morphs');
+    for (const mesh of targets) {
+        const meshFolder = morphsFolder.addFolder(mesh.modelName || `mesh_${mesh.modelId}`);
+        for (const channel of mesh.morph.channels) {
+            channel.weight = PARAMS.morph;
+            meshFolder.add(channel, 'weight', 0, 1, 0.01).name(channel.name || 'channel').listen();
+        }
+    }
+}
+
 function updateTimeController() {
     if (!timeController || !currentScene) return;
     const duration = currentScene.clips[currentScene.currentClip]?.duration ?? 0;
     timeController.max(Math.max(duration, 1));
     PARAMS.clip = currentScene.clips[currentScene.currentClip]?.name ?? '';
     clipController?.updateDisplay();
+}
+
+function updateMorphWeights(clip) {
+    const morphAnims = clip?.morphAnimsByChannel ?? new Map();
+    for (const mesh of currentScene?.morphMeshes ?? []) {
+        mesh.morph.channels.forEach((channel, index) => {
+            const anim = morphAnims.get(channel.channelId);
+            if (anim) channel.weight = sampleCurve(anim.curve, PARAMS.time, 0) / 100;
+            for (const morphInstance of mesh.instances) {
+                morphInstance.setWeight(index, channel.weight);
+            }
+        });
+    }
 }
 
 function updateAnimation(dt) {
@@ -590,6 +651,7 @@ function updateAnimation(dt) {
         if (!base) continue;
         setEntityTransform(entity, base, clip.animationsOf.get(id), PARAMS.time);
     }
+    updateMorphWeights(clip);
 }
 
 function updateCamera() {
