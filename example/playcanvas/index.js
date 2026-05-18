@@ -189,15 +189,65 @@ function makeEntityName(modelNode, fallback) {
 
 function createMesh(meshData, group) {
     const mesh = new pc.Mesh(app.graphicsDevice);
+    const vertexCount = meshData.positions.length / 3;
     mesh.setPositions(meshData.positions);
     mesh.setNormals(meshData.normals);
     if (meshData.hasUVs) mesh.setUvs(0, meshData.uvs);
     if (meshData.hasVertexColor) mesh.setColors(meshData.colors);
+    if (meshData.hasSkin) {
+        mesh.setVertexStream(pc.SEMANTIC_BLENDINDICES, new Uint8Array(meshData.boneIndices), 4, vertexCount, pc.TYPE_UINT8);
+        mesh.setVertexStream(pc.SEMANTIC_BLENDWEIGHT, meshData.boneWeights, 4, vertexCount);
+    }
     const groupIndices = meshData.indices.slice(group.offset, group.offset + group.count);
-    mesh.setIndices(meshData.positions.length / 3 > 65535 ? new Uint32Array(groupIndices) : new Uint16Array(groupIndices));
+    mesh.setIndices(vertexCount > 65535 ? new Uint32Array(groupIndices) : new Uint16Array(groupIndices));
     mesh.update(pc.PRIMITIVE_TRIANGLES);
     resources.push(mesh);
     return mesh;
+}
+
+function createGroundMesh(size) {
+    const half = size * 0.5;
+    const mesh = new pc.Mesh(app.graphicsDevice);
+    mesh.setPositions(new Float32Array([
+        -half, 0, -half,
+         half, 0, -half,
+         half, 0,  half,
+        -half, 0,  half,
+    ]));
+    mesh.setNormals(new Float32Array([
+        0, 1, 0,
+        0, 1, 0,
+        0, 1, 0,
+        0, 1, 0,
+    ]));
+    mesh.setUvs(0, new Float32Array([
+        0, 0,
+        1, 0,
+        1, 1,
+        0, 1,
+    ]));
+    mesh.setIndices(new Uint16Array([0, 2, 1, 0, 3, 2]));
+    mesh.update(pc.PRIMITIVE_TRIANGLES);
+    return mesh;
+}
+
+function createSkinResource(fbxSkin, entityById) {
+    if (!fbxSkin) return null;
+    const bones = fbxSkin.boneModelIds.map(id => entityById.get(id)).filter(Boolean);
+    if (bones.length !== fbxSkin.boneModelIds.length) return null;
+    const boneNames = bones.map(bone => bone.name);
+    const inverseBindPose = fbxSkin.bindInverses.map(matrix => new pc.Mat4().set(matrix));
+    return {
+        skin: new pc.Skin(app.graphicsDevice, inverseBindPose, boneNames),
+        bones,
+    };
+}
+
+function createSkinInstance(skinResource) {
+    if (!skinResource) return null;
+    const skinInstance = new pc.SkinInstance(skinResource.skin);
+    skinInstance.bones = skinResource.bones;
+    return skinInstance;
 }
 
 function setEntityTransform(entity, base, anim, time) {
@@ -396,12 +446,13 @@ async function loadModel(selection) {
             const base = baseTRSOf.get(modelId);
             const meshData = buildMesh(
                 geoNode,
-                null,
+                skin,
                 null,
                 matColors,
                 base ? { T: base.geoT, R: base.geoR, S: base.geoS } : null,
             );
             if (!meshData) continue;
+            const skinResource = createSkinResource(skin, entityById);
 
             const textures = await Promise.all(matsForModel.map(async mat => {
                 if (!meshData.hasUVs) return null;
@@ -415,7 +466,9 @@ async function loadModel(selection) {
             const meshInstances = meshData.groups.map(group => {
                 const material = createMaterial(matColors[group.matIdx] ?? [0.85, 0.85, 0.9], textures[group.matIdx], meshData.hasVertexColor);
                 const mesh = createMesh(meshData, group);
+                if (skinResource) mesh.skin = skinResource.skin;
                 const meshInstance = new pc.MeshInstance(mesh, material, entity);
+                meshInstance.skinInstance = createSkinInstance(skinResource);
                 meshInstance.castShadow = true;
                 return meshInstance;
             });
@@ -443,7 +496,7 @@ async function loadModel(selection) {
         assetController?.updateDisplay();
 
         const duration = currentScene.clips[currentScene.currentClip]?.duration ?? 0;
-        const skinNote = totalSkinnedMeshes ? ` - skinned meshes: ${totalSkinnedMeshes} (bind pose)` : '';
+        const skinNote = totalSkinnedMeshes ? ` - skinned meshes: ${totalSkinnedMeshes}` : '';
         const morphNote = totalMorphs ? ` - morphs: ${totalMorphs} (static)` : '';
         setStatus(`${name} - triangles: ${totalTriangles}${duration ? ` - anim ${duration.toFixed(2)}s` : ''}${skinNote}${morphNote}`);
     } catch (err) {
@@ -622,7 +675,7 @@ function initScene() {
     camera = new pc.Entity('camera');
     camera.addComponent('camera', {
         clearColor: new pc.Color(0.627, 0.627, 0.627),
-        nearClip: 0.01,
+        nearClip: 0.1,
         farClip: 5000,
         fov: 45,
     });
@@ -630,10 +683,16 @@ function initScene() {
     updateCamera();
 
     const groundMat = createMaterial([0.72, 0.74, 0.76], null, false, false);
+    groundMat.cull = pc.CULLFACE_BACK;
+    groundMat.depthWrite = false;
+    groundMat.update();
     ground = new pc.Entity('ground');
-    ground.setLocalPosition(0, -0.02, 0);
-    ground.setLocalScale(1000, 0.02, 1000);
-    ground.addComponent('render', { type: 'box', material: groundMat, castShadows: false, receiveShadows: true });
+    ground.setLocalPosition(0, -1, 0);
+    const groundMesh = createGroundMesh(2000);
+    const groundMeshInstance = new pc.MeshInstance(groundMesh, groundMat, ground);
+    groundMeshInstance.castShadow = false;
+    groundMeshInstance.receiveShadow = true;
+    ground.addComponent('render', { meshInstances: [groundMeshInstance] });
     ground.enabled = PARAMS.ground;
     app.root.addChild(ground);
 }
