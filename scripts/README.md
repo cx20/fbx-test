@@ -50,6 +50,13 @@ keeps output paths consistent.
 | [`debug_fbx.py`](debug_fbx.py) | `gltf/RiggedFigure.fbx` | Quick structure inspection helper. |
 | [`parse_fbx.py`](parse_fbx.py) / [`parse_fbx2.py`](parse_fbx2.py) | `gltf/RiggedFigure.fbx` | Generic FBX dumpers (kept for historical reference; superseded by the focused `check_*.py` scripts). |
 
+### WebGL sample asset diagnostics
+
+| Script | Target FBX | Purpose |
+|---|---|---|
+| [`check_vcube_colors.py`](check_vcube_colors.py) | `vCube.fbx` | Inspect `LayerElementColor` and material diffuse properties used to validate vertex-color handling in the WebGL / PlayCanvas viewers. |
+| [`inspect_for_webgl.py`](inspect_for_webgl.py) | `vCube.fbx`, `gltf/AnimatedTriangle.fbx` | Dump geometry, normal/UV availability, animation stacks, and model transforms for small reference assets used while designing the WebGL 1.0 sample path. |
+
 ### Bind-pose / skinning diagnostics for `gltf/RiggedFigure`
 
 These all target the long-standing shoulder-ROM issue (see
