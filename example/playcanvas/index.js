@@ -15,11 +15,13 @@ const PARAMS = {
     ...createParams(),
     asset: getInitialSelection(),
     skeleton: getBoolParam('skeleton', false),
+    fog: getBoolParam('fog', true),
     ground: getBoolParam('ground', true),
+    grid: getBoolParam('grid', true),
     rotate: getBoolParam('rotate', false),
 };
 
-let app, canvas, camera, light, ground;
+let app, canvas, camera, light, ground, grid;
 let gui, assetController, clipController, timeController, morphsFolder;
 let modelRoot = null;
 let currentScene = null;
@@ -242,6 +244,29 @@ function createGroundMesh(size) {
     return mesh;
 }
 
+function createGridMesh(size, divisions) {
+    const half = size * 0.5;
+    const step = size / divisions;
+    const positions = new Float32Array((divisions + 1) * 4 * 3);
+    const indices = new Uint16Array((divisions + 1) * 4);
+    let positionOffset = 0;
+    let indexOffset = 0;
+
+    for (let i = 0; i <= divisions; i++) {
+        const p = -half + i * step;
+        positions.set([-half, 0, p, half, 0, p, p, 0, -half, p, 0, half], positionOffset);
+        for (let j = 0; j < 4; j++) indices[indexOffset + j] = indexOffset + j;
+        positionOffset += 12;
+        indexOffset += 4;
+    }
+
+    const mesh = new pc.Mesh(app.graphicsDevice);
+    mesh.setPositions(positions);
+    mesh.setIndices(indices);
+    mesh.update(pc.PRIMITIVE_LINES);
+    return mesh;
+}
+
 function createSkinResource(fbxSkin, entityById) {
     if (!fbxSkin) return null;
     const bones = fbxSkin.boneModelIds.map(id => entityById.get(id)).filter(Boolean);
@@ -350,7 +375,13 @@ function updateSkeletonHelper() {
 
 function setSceneVisibility() {
     if (ground) ground.enabled = PARAMS.ground;
+    if (grid) grid.enabled = PARAMS.grid;
     if (skeletonHelper) skeletonHelper.entity.enabled = PARAMS.skeleton;
+    if (!app) return;
+    app.scene.fog.type = PARAMS.fog ? pc.FOG_LINEAR : pc.FOG_NONE;
+    app.scene.fog.color = new pc.Color(0.627, 0.627, 0.627);
+    app.scene.fog.start = 200;
+    app.scene.fog.end = 1000;
 }
 
 function createMorphResource(meshData, fbxMorph) {
@@ -817,8 +848,10 @@ function initGui() {
     assetController = gui.add(PARAMS, 'asset', getAssetOptions()).name('asset').onChange(loadModel);
     gui.add(PARAMS, 'animate').name('play');
     gui.add(PARAMS, 'skeleton').name('skeleton').onChange(setSceneVisibility);
+    gui.add(PARAMS, 'fog').name('fog').onChange(setSceneVisibility);
     gui.add(PARAMS, 'rotate').name('rotate');
     gui.add(PARAMS, 'ground').name('ground').onChange(setSceneVisibility);
+    gui.add(PARAMS, 'grid').name('grid').onChange(setSceneVisibility);
 }
 
 function initScene() {
@@ -830,6 +863,7 @@ function initScene() {
     window.addEventListener('resize', () => app.resizeCanvas(canvas.width, canvas.height));
 
     app.scene.ambientLight = new pc.Color(0.65, 0.65, 0.65);
+    setSceneVisibility();
 
     light = new pc.Entity('light');
     light.addComponent('light', {
@@ -854,6 +888,8 @@ function initScene() {
 
     const groundMat = createMaterial([0.72, 0.74, 0.76], null, false, false);
     groundMat.cull = pc.CULLFACE_BACK;
+    groundMat.opacity = 0.45;
+    groundMat.blendType = pc.BLEND_NORMAL;
     groundMat.depthWrite = false;
     groundMat.update();
     ground = new pc.Entity('ground');
@@ -865,6 +901,25 @@ function initScene() {
     ground.addComponent('render', { meshInstances: [groundMeshInstance] });
     ground.enabled = PARAMS.ground;
     app.root.addChild(ground);
+
+    const gridMat = createMaterial([0, 0, 0], null, false, false);
+    gridMat.emissive = new pc.Color(0, 0, 0);
+    gridMat.opacity = 0.2;
+    gridMat.blendType = pc.BLEND_NORMAL;
+    gridMat.useLighting = false;
+    gridMat.depthWrite = false;
+    gridMat.update();
+    grid = new pc.Entity('grid');
+    grid.setLocalPosition(0, 0.01, 0);
+    const gridMesh = createGridMesh(2000, 20);
+    const gridMeshInstance = new pc.MeshInstance(gridMesh, gridMat, grid);
+    gridMeshInstance.castShadow = false;
+    gridMeshInstance.receiveShadow = false;
+    grid.addComponent('render', { meshInstances: [gridMeshInstance] });
+    grid.enabled = PARAMS.grid;
+    app.root.addChild(grid);
+
+    setSceneVisibility();
 }
 
 async function main() {
